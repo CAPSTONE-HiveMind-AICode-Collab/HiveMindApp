@@ -24,3 +24,18 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+.hex {
+  position: relative;
+  background-color: #fef3c7; /* light yellow */
+  color: #111827;
+  padding: 1rem;
+  margin: 0.5rem 0;
+  width: 45%; /* half screen */
+  clip-path: polygon(
+    25% 0%, 75% 0%, 
+    100% 50%, 75% 100%, 
+    25% 100%, 0% 50%
+  );
+  word-wrap: break-word;
+}

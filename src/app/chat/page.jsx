@@ -84,14 +84,39 @@ export default function ChatPage() {
       </div>
     );
 
+    function renderMessageText(text) {
+        const parts = text.split(/```/); // split on triple backticks
+        return parts.map((part, i) =>
+            i % 2 === 1 ? (
+            // odd indexes are code
+            <pre
+                key={i}
+                className="bg-gray-300 p-2 rounded text-sm overflow-x-auto"
+            >
+                <button
+                    className="text-xs bg-blue-500 text-white px-2 py-1 rounded hover:bg-blue-600 active:bg-blue-700 transition-colors duration-150 ml-2 cursor-pointer "
+                    onClick={() => navigator.clipboard.writeText(part)}
+                    >
+                    Copy
+                </button>
+                <code>{part}</code>
+            </pre>
+            ) : (
+            // even indexes are normal text
+            <p key={i} className="text-sm text-gray-900 break-words">{part}</p>
+            )
+        );
+    }
+
+
   return (
     <div className="flex flex-col h-screen">
       {/* Header */}
-      <header className="p-4 bg-yellow-500 text-white flex justify-between items-center">
+      <header className="p-4 bg-yellow-500 text-white flex justify-between items-center border border-gray-900">
         <h1 className="font-bold text-lg">Hive Mind Chat</h1>
         <button
           onClick={() => signOut(auth)}
-          className="bg-white text-yellow-500 px-3 py-1 rounded hover:bg-gray-100"
+          className="bg-white text-yellow-500 px-3 py-1 rounded hover:bg-gray-100 border border-gray-900"
         >
           Sign Out
         </button>
@@ -103,13 +128,14 @@ export default function ChatPage() {
             <div
                 key={m.id}
                 className={`p-2 rounded-lg break-words
-                ${m.senderId === user.uid 
-                    ? "bg-yellow-300 ml-auto w-1/2"   // Your own messages: right-aligned, half screen
-                    : "bg-white w-1/2"}               // AI/other messages: left-aligned, half screen
+                    ${m.senderId === user.uid
+                    ? "bg-yellow-300 ml-auto w-1/2 border border-yellow-900"
+                    : "bg-white w-1/2 border border-gray-900"}
                 `}
-            >
-                <p className="text-sm font-semibold text-gray-700">{m.sender}</p>
-                <p className="text-sm text-gray-900">{m.text}</p>
+                >
+                <p className="text-sm font-bold underline text-gray-800">{m.sender}</p>
+                <p className="text-sm text-gray-900">{renderMessageText(m.text)}</p>
+                
                 {m.senderId === user.uid && (
                 <button
                     className="mt-1 text-xs text-blue-600 hover:underline"
