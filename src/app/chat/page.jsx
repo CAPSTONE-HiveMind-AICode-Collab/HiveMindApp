@@ -91,10 +91,10 @@ export default function ChatPage() {
             // odd indexes are code
             <pre
                 key={i}
-                className="bg-gray-300 p-2 rounded text-sm overflow-x-auto"
+                className="bg-gray-300 p-2 rounded text-sm overflow-x-auto border border-gray-900"
             >
                 <button
-                    className="text-xs bg-blue-500 text-white px-2 py-1 rounded hover:bg-blue-600 active:bg-blue-700 transition-colors duration-150 ml-2 cursor-pointer "
+                    className="text-xs bg-blue-500 text-white px-2 py-1 rounded hover:bg-blue-600 active:bg-blue-700 transition-colors duration-150 ml-2 cursor-pointer"
                     onClick={() => navigator.clipboard.writeText(part)}
                     >
                     Copy
