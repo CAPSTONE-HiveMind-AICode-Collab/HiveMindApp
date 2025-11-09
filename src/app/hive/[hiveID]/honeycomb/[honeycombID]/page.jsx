@@ -3,25 +3,27 @@
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { subscribeToChatMessages, sendUserMessage, sendAIReply } from "@/lib/business/chatService";
+import { useUser } from "@/lib/auth/userContext";
 
-export default function HoneycombChatPage({ user }) {
+export default function HoneycombChatPage() {
   const { hiveID, honeycombID } = useParams();
   const router = useRouter();
+  const { user, loading } = useUser();
+
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState([]);
   const [loadingAI, setLoadingAI] = useState(false);
 
-  // Listen for chat messages
   useEffect(() => {
-    if (!hiveID || !honeycombID) return;
+    if (!user || !hiveID || !honeycombID) return;
     const unsubscribe = subscribeToChatMessages(setMessages, hiveID, honeycombID);
     return unsubscribe;
-  }, [hiveID, honeycombID]);
+  }, [user, hiveID, honeycombID]);
 
-  // Send message
   const handleSendMessage = async (e) => {
     e.preventDefault();
     if (!message.trim() || !user) return;
+
     try {
       await sendUserMessage(user, message, hiveID, honeycombID);
       setMessage("");
@@ -30,7 +32,6 @@ export default function HoneycombChatPage({ user }) {
     }
   };
 
-  // Ask AI
   const handleAIReply = async (text) => {
     if (!text) return;
     try {
@@ -43,7 +44,6 @@ export default function HoneycombChatPage({ user }) {
     }
   };
 
-  // Format messages
   const renderMessageText = (text) => {
     const parts = text.split(/```/);
     return parts.map((part, i) =>
@@ -63,9 +63,14 @@ export default function HoneycombChatPage({ user }) {
     );
   };
 
+  if (loading) return <p className="p-4 text-center">Loading user info...</p>;
+  if (!user) {
+    router.replace("/"); // redirect if not signed in
+    return null;
+  }
+
   return (
     <div className="flex flex-col h-screen bg-yellow-50">
-      {/* Header with Back button */}
       <header className="p-4 bg-yellow-500 text-white flex justify-between items-center border-b border-yellow-700">
         <h1 className="font-bold text-lg">🐝 {hiveID} / {honeycombID}</h1>
         <button
@@ -76,7 +81,6 @@ export default function HoneycombChatPage({ user }) {
         </button>
       </header>
 
-      {/* Messages */}
       <main className="flex-1 overflow-y-auto p-4 space-y-2">
         {messages.map((m) => (
           <div
@@ -103,11 +107,7 @@ export default function HoneycombChatPage({ user }) {
         ))}
       </main>
 
-      {/* Message input */}
-      <form
-        onSubmit={handleSendMessage}
-        className="p-4 flex bg-white border-t border-gray-300"
-      >
+      <form onSubmit={handleSendMessage} className="p-4 flex bg-white border-t border-gray-300">
         <input
           className="flex-1 border border-gray-400 rounded-lg p-2 mr-2 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400"
           placeholder="Type your message..."
