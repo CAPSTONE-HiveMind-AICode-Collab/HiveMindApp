@@ -2,7 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { subscribeToChatMessages, sendUserMessage, sendAIReply } from "@/lib/business/chatService";
+import {
+  useSendUserMessage,
+  sendAIReply,
+  subscribeToChatMessages,
+  subscribeToThreadMessages,
+  useSendThreadMessage,
+} from "@/lib/business/chatService";
 import { useUser } from "@/lib/auth/userContext";
 
 export default function HoneycombChatPage() {
@@ -12,23 +18,53 @@ export default function HoneycombChatPage() {
 
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState([]);
+  const [threads, setThreads] = useState({});
   const [loadingAI, setLoadingAI] = useState(false);
 
+  const sendUserMessage = useSendUserMessage();
+  const sendThreadMessage = useSendThreadMessage();
+
+  // Subscribe to main messages
   useEffect(() => {
     if (!user || !hiveID || !honeycombID) return;
     const unsubscribe = subscribeToChatMessages(setMessages, hiveID, honeycombID);
     return unsubscribe;
   }, [user, hiveID, honeycombID]);
 
+  // Subscribe to threads for each message
+  useEffect(() => {
+    if (!user) return;
+
+    const unsubscribers = messages.map((msg) =>
+      subscribeToThreadMessages(
+        (msgThreads) => setThreads((prev) => ({ ...prev, [msg.id]: msgThreads })),
+        hiveID,
+        honeycombID,
+        msg.id
+      )
+    );
+
+    return () => unsubscribers.forEach((u) => u && u());
+  }, [messages, user, hiveID, honeycombID]);
+
   const handleSendMessage = async (e) => {
     e.preventDefault();
-    if (!message.trim() || !user) return;
+    if (!message.trim()) return;
 
     try {
-      await sendUserMessage(user, message, hiveID, honeycombID);
+      await sendUserMessage(message, hiveID, honeycombID);
       setMessage("");
     } catch (err) {
       console.error("Send message failed:", err);
+    }
+  };
+
+  const handleSendThread = async (text, parentMessageID) => {
+    if (!text.trim()) return;
+    try {
+      await sendThreadMessage(text, hiveID, honeycombID, parentMessageID);
+    } catch (err) {
+      console.error("Send thread failed:", err);
     }
   };
 
@@ -48,7 +84,10 @@ export default function HoneycombChatPage() {
     const parts = text.split(/```/);
     return parts.map((part, i) =>
       i % 2 === 1 ? (
-        <pre key={i} className="bg-gray-300 p-2 rounded text-sm overflow-x-auto border border-gray-900">
+        <pre
+          key={i}
+          className="bg-gray-300 p-2 rounded text-sm overflow-x-auto border border-gray-900"
+        >
           <button
             className="text-xs bg-blue-500 text-white px-2 py-1 rounded hover:bg-blue-600 ml-2 cursor-pointer"
             onClick={() => navigator.clipboard.writeText(part)}
@@ -58,7 +97,9 @@ export default function HoneycombChatPage() {
           <code>{part}</code>
         </pre>
       ) : (
-        <p key={i} className="text-sm text-gray-900 break-words">{part}</p>
+        <p key={i} className="text-sm text-gray-900 break-words">
+          {part}
+        </p>
       )
     );
   };
@@ -103,6 +144,22 @@ export default function HoneycombChatPage() {
                 {loadingAI ? "Thinking..." : "Ask AI 🤖"}
               </button>
             )}
+
+            {/* Threads */}
+            <div className="ml-4 mt-2 space-y-1">
+              {(threads[m.id] || []).map((thread) => (
+                <div
+                  key={thread.id}
+                  className="mb-1 p-2 rounded-md bg-gray-100 border border-gray-300"
+                >
+                  <p className="text-xs font-semibold text-gray-800">{thread.sender}</p>
+                  <p className="text-sm text-gray-900 break-words">{thread.text}</p>
+                </div>
+              ))}
+
+              {/* Thread input */}
+              <ThreadInput parentMessageID={m.id} onSend={handleSendThread} />
+            </div>
           </div>
         ))}
       </main>
@@ -124,3 +181,31 @@ export default function HoneycombChatPage() {
     </div>
   );
 }
+
+function ThreadInput({ parentMessageID, onSend }) {
+  const [text, setText] = useState("");
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!text.trim()) return;
+    onSend(text, parentMessageID);
+    setText("");
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="flex mt-1">
+      <input
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Reply in thread..."
+        className="flex-1 border border-gray-300 rounded-md p-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400"
+      />
+      <button
+        type="submit"
+        className="ml-1 px-3 py-1 bg-yellow-400 text-white rounded-md text-sm font-semibold hover:bg-yellow-500"
+      >
+        Reply
+      </button>
+    </form>
+  );
+}
+
