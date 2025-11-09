@@ -20,6 +20,7 @@ export default function HoneycombChatPage() {
   const [messages, setMessages] = useState([]);
   const [threads, setThreads] = useState({});
   const [loadingAI, setLoadingAI] = useState(false);
+  const [activeThreadMessageID, setActiveThreadMessageID] = useState(null);
 
   const sendUserMessage = useSendUserMessage();
   const sendThreadMessage = useSendThreadMessage();
@@ -47,6 +48,7 @@ export default function HoneycombChatPage() {
     return () => unsubscribers.forEach((u) => u && u());
   }, [messages, user, hiveID, honeycombID]);
 
+  // Send main message
   const handleSendMessage = async (e) => {
     e.preventDefault();
     if (!message.trim()) return;
@@ -59,6 +61,7 @@ export default function HoneycombChatPage() {
     }
   };
 
+  // Send thread message
   const handleSendThread = async (text, parentMessageID) => {
     if (!text.trim()) return;
     try {
@@ -68,6 +71,7 @@ export default function HoneycombChatPage() {
     }
   };
 
+  // AI reply
   const handleAIReply = async (text) => {
     if (!text) return;
     try {
@@ -80,6 +84,7 @@ export default function HoneycombChatPage() {
     }
   };
 
+  // Render message with code formatting
   const renderMessageText = (text) => {
     const parts = text.split(/```/);
     return parts.map((part, i) =>
@@ -111,77 +116,105 @@ export default function HoneycombChatPage() {
   }
 
   return (
-    <div className="flex flex-col h-screen bg-yellow-50">
-      <header className="p-4 bg-yellow-500 text-white flex justify-between items-center border-b border-yellow-700">
-        <h1 className="font-bold text-lg">🐝 {hiveID} / {honeycombID}</h1>
-        <button
-          onClick={() => router.push(`/hive/${hiveID}`)}
-          className="bg-white text-yellow-500 px-3 py-1 rounded hover:bg-gray-100 border border-yellow-700"
-        >
-          Back to Hive
-        </button>
-      </header>
-
-      <main className="flex-1 overflow-y-auto p-4 space-y-2">
-        {messages.map((m) => (
-          <div
-            key={m.id}
-            className={`p-2 rounded-lg break-words ${
-              m.senderId === user.uid
-                ? "bg-yellow-300 ml-auto w-1/2 border border-yellow-700"
-                : "bg-white w-1/2 border border-gray-400"
-            }`}
+    <div className="flex h-screen bg-yellow-50">
+      {/* Main chat panel */}
+      <div className="flex-1 flex flex-col">
+        <header className="p-4 bg-yellow-500 text-white flex justify-between items-center border-b border-yellow-700">
+          <h1 className="font-bold text-lg">
+            🐝 {hiveID} / {honeycombID}
+          </h1>
+          <button
+            onClick={() => router.push(`/hive/${hiveID}`)}
+            className="bg-white text-yellow-500 px-3 py-1 rounded hover:bg-gray-100 border border-yellow-700"
           >
-            <p className="text-sm font-bold underline text-gray-800">{m.sender}</p>
-            <div className="text-sm text-gray-900">{renderMessageText(m.text)}</div>
+            Back to Hive
+          </button>
+        </header>
 
-            {m.senderId === user.uid && (
-              <button
-                className="mt-1 text-xs text-blue-600 hover:underline"
-                onClick={() => handleAIReply(m.text)}
-                disabled={loadingAI}
-              >
-                {loadingAI ? "Thinking..." : "Ask AI 🤖"}
-              </button>
-            )}
+        <main className="flex-1 overflow-y-auto p-4 space-y-2">
+          {messages.map((m) => (
+            <div
+              key={m.id}
+              className={`p-2 rounded-lg break-words ${
+                m.senderId === user.uid
+                  ? "bg-yellow-300 ml-auto w-1/2 border border-yellow-700"
+                  : "bg-white w-1/2 border border-gray-400"
+              }`}
+            >
+              <p className="text-sm font-bold underline text-gray-800">{m.sender}</p>
+              <div className="text-sm text-gray-900">{renderMessageText(m.text)}</div>
 
-            {/* Threads */}
-            <div className="ml-4 mt-2 space-y-1">
-              {(threads[m.id] || []).map((thread) => (
-                <div
-                  key={thread.id}
-                  className="mb-1 p-2 rounded-md bg-gray-100 border border-gray-300"
+              <div className="flex space-x-2 mt-1">
+                {m.senderId === user.uid && (
+                  <button
+                    className="text-xs text-blue-600 hover:underline"
+                    onClick={() => handleAIReply(m.text)}
+                    disabled={loadingAI}
+                  >
+                    {loadingAI ? "Thinking..." : "Ask AI 🤖"}
+                  </button>
+                )}
+                <button
+                  className="text-xs text-gray-700 hover:underline"
+                  onClick={() => setActiveThreadMessageID(m.id)}
                 >
-                  <p className="text-xs font-semibold text-gray-800">{thread.sender}</p>
-                  <p className="text-sm text-gray-900 break-words">{thread.text}</p>
-                </div>
-              ))}
-
-              {/* Thread input */}
-              <ThreadInput parentMessageID={m.id} onSend={handleSendThread} />
+                  {threads[m.id]?.length > 0 ? "View Thread" : "Start Thread"}
+                </button>
+              </div>
             </div>
-          </div>
-        ))}
-      </main>
+          ))}
+        </main>
 
-      <form onSubmit={handleSendMessage} className="p-4 flex bg-white border-t border-gray-300">
-        <input
-          className="flex-1 border border-gray-400 rounded-lg p-2 mr-2 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400"
-          placeholder="Type your message..."
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-        />
-        <button
-          type="submit"
-          className="bg-yellow-400 px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700"
+        <form
+          onSubmit={handleSendMessage}
+          className="p-4 flex bg-white border-t border-gray-300"
         >
-          Send
-        </button>
-      </form>
+          <input
+            className="flex-1 border border-gray-400 rounded-lg p-2 mr-2 text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400"
+            placeholder="Type your message..."
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+          />
+          <button
+            type="submit"
+            className="bg-yellow-400 px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700"
+          >
+            Send
+          </button>
+        </form>
+      </div>
+
+      {/* Thread panel */}
+      {activeThreadMessageID && (
+        <div className="fixed right-0 top-0 h-full w-96 bg-white border-l border-gray-300 p-4 shadow-lg flex flex-col z-50">
+          <button
+            className="bg-yellow-400 px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700"
+            onClick={() => setActiveThreadMessageID(null)}
+          >
+            Close
+          </button>
+
+          <div className="flex-1 overflow-y-auto">
+            <p className="font-bold mb-2 text-gray-900">
+              {messages.find((m) => m.id === activeThreadMessageID)?.text}
+            </p>
+
+            {(threads[activeThreadMessageID] || []).map((thread) => (
+              <div key={thread.id} className="mb-2 p-2 bg-gray-100 rounded-md border border-gray-300">
+                <p className="text-xs font-semibold text-gray-800">{thread.sender}</p>
+                <p className="text-sm text-gray-900 break-words">{thread.text}</p>
+              </div>
+            ))}
+          </div>
+
+          <ThreadInput parentMessageID={activeThreadMessageID} onSend={handleSendThread} />
+        </div>
+      )}
     </div>
   );
 }
 
+// Thread input component
 function ThreadInput({ parentMessageID, onSend }) {
   const [text, setText] = useState("");
   const handleSubmit = (e) => {
@@ -192,7 +225,7 @@ function ThreadInput({ parentMessageID, onSend }) {
   };
 
   return (
-    <form onSubmit={handleSubmit} className="flex mt-1">
+    <form onSubmit={handleSubmit} className="flex mt-2">
       <input
         value={text}
         onChange={(e) => setText(e.target.value)}
@@ -208,4 +241,3 @@ function ThreadInput({ parentMessageID, onSend }) {
     </form>
   );
 }
-
