@@ -1,4 +1,4 @@
-// src/firebase/config.js
+// src/lib/firebase/config.js
 import { initializeApp } from "firebase/app";
 import { getAI, getGenerativeModel, GoogleAIBackend } from "firebase/ai";
 import { getAuth, GoogleAuthProvider } from "firebase/auth";
@@ -23,6 +23,6 @@ export const auth = getAuth(firebaseApp);
 export const provider = new GoogleAuthProvider();
 
 // Initialize AI
-export const ai = getAI(firebaseApp, { backend: new GoogleAIBackend() });
-export const model = getGenerativeModel(ai, { model: "gemini-2.5-flash" });
+export const ai = getAI(firebaseApp);
+export const model = getGenerativeModel(ai, { model: "gemini-2.5-flash-lite"})
 

@@ -1,4 +1,4 @@
-// src/data/aiRepository.js
+// src/lib/data/aiRepository.js
 export async function callGeminiAPI(userText) {
   try {
     const response = await fetch("/api/ai", {
@@ -7,9 +7,7 @@ export async function callGeminiAPI(userText) {
       body: JSON.stringify({ message: userText }),
     });
 
-    if (!response.ok) {
-      throw new Error("Failed to get AI response");
-    }
+    if (!response.ok) throw new Error("Failed to get AI response");
 
     const data = await response.json();
     return data.reply || "Sorry, I couldn’t generate a response.";

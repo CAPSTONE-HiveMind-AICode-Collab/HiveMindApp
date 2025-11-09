@@ -13,8 +13,9 @@ import {
   serverTimestamp,
   where,
 } from "firebase/firestore";
-import { db } from "../firebase/config";
+import { db, model } from "@/lib/firebase/config"; 
 import { useUser } from "../auth/userContext";
+import { callGeminiAPI } from "@/lib/data/aiRepository";
 
 /* ----------------- USER MESSAGES ----------------- */
 
@@ -96,21 +97,38 @@ export function subscribeToThreadMessages(callback, hiveID, honeycombID, parentM
   const threadRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", parentMessageID, "Threads");
   const q = query(threadRef, orderBy("timestamp", "asc"));
   return onSnapshot(q, (snapshot) => {
-    const threads = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    const threads = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data(), status: doc.data().status || "open" }));
     callback(threads);
   });
 }
 
+
 /* ----------------- AI REPLIES ----------------- */
 
 export async function sendAIReply(text, hiveID, honeycombID) {
-  const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
-  await addDoc(messagesRef, {
-    text: `AI reply to: ${text}`,
-    sender: "AI Bot",
-    senderId: "AI",
-    timestamp: serverTimestamp(),
-  });
+  try {
+    // Call your Gemini AI model
+    const aiResponse = await callGeminiAPI(text); // or call directly via model if you want
+
+    const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
+    await addDoc(messagesRef, {
+      text: aiResponse, // save the actual AI reply
+      sender: "AI Bot",
+      senderId: "AI",
+      timestamp: serverTimestamp(),
+    });
+  } catch (error) {
+    console.error("Failed to send AI reply:", error);
+
+    // Optional fallback message
+    const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
+    await addDoc(messagesRef, {
+      text: "AI could not generate a response.",
+      sender: "AI Bot",
+      senderId: "AI",
+      timestamp: serverTimestamp(),
+    });
+  }
 }
 
 /* ----------------- UNREAD TRACKING ----------------- */
@@ -234,4 +252,10 @@ export async function getAllUnreadCounts(hiveID, uid) {
 
   const results = await Promise.all(countsPromises);
   return Object.fromEntries(results);
+}
+
+export async function setThreadStatus(hiveID, honeycombID, parentMessageID, threadID, status) {
+  if (!["open", "closed"].includes(status)) throw new Error("Invalid status");
+  const threadRef = doc(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", parentMessageID, "Threads", threadID);
+  await setDoc(threadRef, { status }, { merge: true });
 }
