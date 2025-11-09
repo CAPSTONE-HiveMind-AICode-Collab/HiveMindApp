@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { db } from "@/lib/firebase/config";
 import { collection, getDocs, doc, setDoc } from "firebase/firestore";
 import { useUser } from "@/lib/auth/userContext";
+import { getAllUnreadCounts, updateLastSeen } from "@/lib/business/chatService";
 
 export default function HivePage() {
   const { hiveID } = useParams();
@@ -13,6 +14,7 @@ export default function HivePage() {
 
   const [honeycombs, setHoneycombs] = useState([]);
   const [newHoneycombName, setNewHoneycombName] = useState("");
+  const [unreadCounts, setUnreadCounts] = useState({});
 
   // Fetch honeycombs for this hive
   useEffect(() => {
@@ -28,52 +30,111 @@ export default function HivePage() {
     fetchHoneycombs();
   }, [user, hiveID]);
 
+  // Fetch unread counts for each honeycomb
+  useEffect(() => {
+    if (!user || !hiveID) return;
+
+    async function fetchUnread() {
+      const counts = await getAllUnreadCounts(hiveID, user.uid);
+      setUnreadCounts(counts);
+    }
+
+    fetchUnread();
+
+    const interval = setInterval(fetchUnread, 10000);
+    return () => clearInterval(interval);
+  }, [user, hiveID]);
+
+  // Create new Honeycomb
   const createHoneycomb = async () => {
     if (!newHoneycombName || !user) return;
+
     const honeycombID = newHoneycombName.toLowerCase().replace(/\s+/g, "-");
     await setDoc(doc(db, "Hive", hiveID, "Honeycomb", honeycombID), {
       name: newHoneycombName,
       ownerId: user.uid,
       createdAt: new Date(),
     });
+
     setNewHoneycombName("");
     setHoneycombs([...honeycombs, { id: honeycombID, name: newHoneycombName }]);
   };
 
+  // Click handler: go to honeycomb and update lastSeen
+  const openHoneycomb = async (honeycombID) => {
+    if (user) {
+      await updateLastSeen(hiveID, honeycombID, null, user.uid);
+    }
+    router.push(`/hive/${hiveID}/honeycomb/${honeycombID}`);
+  };
+
+  // Loading / Auth
   if (loading) return <p style={{ textAlign: "center" }}>Loading...</p>;
   if (!user) {
-    router.replace("/"); // redirect if not signed in
+    router.replace("/");
     return null;
   }
 
   return (
-    <div style={{ backgroundColor: "#fffbee", minHeight: "100vh", padding: "40px", fontFamily: "'Segoe UI', sans-serif", color: "#333" }}>
+    <div
+      style={{
+        backgroundColor: "#fffbee",
+        minHeight: "100vh",
+        padding: "40px",
+        fontFamily: "'Segoe UI', sans-serif",
+        color: "#333",
+      }}
+    >
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <h1 style={{ color: "#d4af37" }}>🐝 Hive: {hiveID}</h1>
         <button
           onClick={() => router.push("/dashboard")}
-          style={{ backgroundColor: "#d4af37", border: "none", padding: "8px 16px", borderRadius: "5px", cursor: "pointer", color: "#fff", fontWeight: "bold" }}
+          style={{
+            backgroundColor: "#d4af37",
+            border: "none",
+            padding: "8px 16px",
+            borderRadius: "5px",
+            cursor: "pointer",
+            color: "#fff",
+            fontWeight: "bold",
+          }}
         >
           Back to Dashboard
         </button>
       </div>
 
+      {/* Create Honeycomb */}
       <div style={{ marginTop: "30px" }}>
         <input
           type="text"
           value={newHoneycombName}
           onChange={(e) => setNewHoneycombName(e.target.value)}
           placeholder="New Honeycomb Name"
-          style={{ padding: "8px", borderRadius: "5px", border: "1px solid #d4af37", width: "250px", marginRight: "10px" }}
+          style={{
+            padding: "8px",
+            borderRadius: "5px",
+            border: "1px solid #d4af37",
+            width: "250px",
+            marginRight: "10px",
+          }}
         />
         <button
           onClick={createHoneycomb}
-          style={{ backgroundColor: "#d4af37", border: "none", padding: "8px 16px", borderRadius: "5px", cursor: "pointer", color: "#fff", fontWeight: "bold" }}
+          style={{
+            backgroundColor: "#d4af37",
+            border: "none",
+            padding: "8px 16px",
+            borderRadius: "5px",
+            cursor: "pointer",
+            color: "#fff",
+            fontWeight: "bold",
+          }}
         >
           Create Honeycomb
         </button>
       </div>
 
+      {/* Honeycomb List */}
       <h2 style={{ marginTop: "40px", color: "#b8860b" }}>Honeycombs</h2>
       <ul style={{ listStyle: "none", padding: 0 }}>
         {honeycombs.map((honeycomb) => (
@@ -87,12 +148,31 @@ export default function HivePage() {
               boxShadow: "0 2px 5px rgba(0,0,0,0.1)",
               cursor: "pointer",
               transition: "transform 0.1s",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
             }}
             onMouseEnter={(e) => (e.currentTarget.style.transform = "scale(1.02)")}
             onMouseLeave={(e) => (e.currentTarget.style.transform = "scale(1)")}
-            onClick={() => router.push(`/hive/${hiveID}/honeycomb/${honeycomb.id}`)}
+            onClick={() => openHoneycomb(honeycomb.id)}
           >
-            {honeycomb.name}
+            <span>{honeycomb.name}</span>
+            {unreadCounts[honeycomb.id] > 0 && (
+              <span
+                style={{
+                  backgroundColor: "#d9534f",
+                  color: "#fff",
+                  borderRadius: "12px",
+                  padding: "4px 8px",
+                  fontSize: "12px",
+                  fontWeight: "bold",
+                  marginLeft: "10px",
+                  boxShadow: "0 1px 3px rgba(0,0,0,0.2)",
+                }}
+              >
+                {unreadCounts[honeycomb.id]}
+              </span>
+            )}
           </li>
         ))}
       </ul>
