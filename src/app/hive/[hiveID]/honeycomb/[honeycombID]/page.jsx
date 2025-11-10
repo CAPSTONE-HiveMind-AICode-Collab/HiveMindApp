@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   useSendUserMessage,
@@ -13,7 +13,7 @@ import {
   setThreadStatus,
 } from "@/lib/business/chatService";
 import { useUser } from "@/lib/auth/userContext";
-import { callGeminiAPI } from "@/lib/data/aiRepository"; // ✅ import the AI function
+import { callGeminiAPI } from "@/lib/data/aiRepository";
 import { db } from "@/lib/firebase/config";
 import { collection, addDoc, serverTimestamp } from "firebase/firestore";
 
@@ -39,21 +39,26 @@ export default function HoneycombChatPage() {
     if (!user || !hiveID || !honeycombID) return;
 
     let mounted = true;
+
+    const markAllRead = async () => {
+      try {
+        await updateLastSeen(hiveID, honeycombID, null, user.uid);
+        const unreadCount = await getHoneycombUnreadCount(hiveID, honeycombID, user.uid);
+        if (mounted) setUnreadMessageCount(unreadCount);
+      } catch (err) {
+        console.error("Failed to mark honeycomb as read:", err);
+      }
+    };
+
     const unsubscribe = subscribeToChatMessages(async (msgs) => {
       if (!mounted) return;
       setMessages(msgs);
 
-      try {
-        const unreadCount = await getHoneycombUnreadCount(hiveID, honeycombID, user.uid);
-        if (mounted) setUnreadMessageCount(unreadCount);
-      } catch (err) {
-        console.error("Failed to get honeycomb unread count:", err);
-      }
+      // mark as read automatically when messages arrive
+      await markAllRead();
     }, hiveID, honeycombID);
 
-    updateLastSeen(hiveID, honeycombID, null, user.uid).catch((e) =>
-      console.error("updateLastSeen (honeycomb) failed:", e)
-    );
+    markAllRead(); // also mark read on mount
 
     return () => {
       mounted = false;
@@ -63,35 +68,24 @@ export default function HoneycombChatPage() {
 
   /* ----------------- THREAD SUBSCRIPTIONS ----------------- */
   useEffect(() => {
-    if (!user || !hiveID || !honeycombID) return;
-    if (messages.length === 0) {
-      setThreads({});
-      setUnreadThreads({});
-      return;
-    }
+    if (!user || !hiveID || !honeycombID || messages.length === 0) return;
 
     const unsubscribers = messages.map((msg) => {
-      const unsub = subscribeToThreadMessages(
-        async (msgThreads) => {
-          const threadsWithStatus = msgThreads.map(t => ({ ...t, status: t.status || "open" }));
-          setThreads(prev => ({ ...prev, [msg.id]: threadsWithStatus }));
+      return subscribeToThreadMessages(async (msgThreads) => {
+        const threadsWithStatus = msgThreads.map(t => ({ ...t, status: t.status || "open" }));
+        setThreads(prev => ({ ...prev, [msg.id]: threadsWithStatus }));
 
-          try {
-            const count = await getThreadUnreadCount(hiveID, honeycombID, msg.id, user.uid);
-            setUnreadThreads(prev => ({ ...prev, [msg.id]: count }));
-          } catch (err) {
-            console.error(`getThreadUnreadCount failed for message ${msg.id}:`, err);
-            setUnreadThreads(prev => ({ ...prev, [msg.id]: 0 }));
-          }
-        },
-        hiveID,
-        honeycombID,
-        msg.id
-      );
-      return unsub;
+        try {
+          const count = await getThreadUnreadCount(hiveID, honeycombID, msg.id, user.uid);
+          setUnreadThreads(prev => ({ ...prev, [msg.id]: count }));
+        } catch (err) {
+          console.error(`getThreadUnreadCount failed for message ${msg.id}:`, err);
+          setUnreadThreads(prev => ({ ...prev, [msg.id]: 0 }));
+        }
+      }, hiveID, honeycombID, msg.id);
     });
 
-    return () => unsubscribers.forEach((u) => u && u());
+    return () => unsubscribers.forEach(u => u && u());
   }, [messages, user, hiveID, honeycombID]);
 
   /* ----------------- SEND MESSAGE ----------------- */
@@ -101,7 +95,6 @@ export default function HoneycombChatPage() {
     try {
       await sendUserMessage(message, hiveID, honeycombID);
       setMessage("");
-      await updateLastSeen(hiveID, honeycombID, null, user.uid);
       const unreadCount = await getHoneycombUnreadCount(hiveID, honeycombID, user.uid);
       setUnreadMessageCount(unreadCount);
     } catch (err) {
@@ -127,9 +120,8 @@ export default function HoneycombChatPage() {
     if (!text) return;
     try {
       setLoadingAI(true);
-      const aiText = await callGeminiAPI(text); // ✅ call server-side API
+      const aiText = await callGeminiAPI(text);
 
-      // Save AI response to Firestore under the current honeycomb
       const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
       await addDoc(messagesRef, {
         text: aiText,
@@ -144,8 +136,8 @@ export default function HoneycombChatPage() {
     }
   };
 
-  /* ----------------- THREAD OPEN ----------------- */
-  const handleOpenThread = async (messageID) => {
+  /* ----------------- OPEN THREAD ----------------- */
+  const handleOpenThread = useCallback(async (messageID) => {
     setActiveThreadMessageID(messageID);
     try {
       await updateLastSeen(hiveID, honeycombID, messageID, user.uid);
@@ -155,17 +147,14 @@ export default function HoneycombChatPage() {
     } catch (err) {
       console.error("Opening thread failed:", err);
     }
-  };
+  }, [hiveID, honeycombID, user]);
 
   /* ----------------- HELPER: RENDER MESSAGE TEXT ----------------- */
   const renderMessageText = (text) => {
     const parts = text.split(/```/);
     return parts.map((part, i) =>
       i % 2 === 1 ? (
-        <pre
-          key={i}
-          className="bg-gray-200 p-2 rounded text-sm overflow-x-auto border border-gray-700"
-        >
+        <pre key={i} className="bg-gray-200 p-2 rounded text-sm overflow-x-auto border border-gray-700">
           <button
             className="text-xs bg-blue-500 text-white px-2 py-1 rounded hover:bg-blue-600 ml-2"
             onClick={() => navigator.clipboard.writeText(part)}
@@ -270,7 +259,10 @@ export default function HoneycombChatPage() {
             value={message}
             onChange={(e) => setMessage(e.target.value)}
           />
-          <button type="submit" className="bg-yellow-400 px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700">
+          <button
+            type="submit"
+            className="bg-yellow-400 px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700"
+          >
             Send
           </button>
         </form>
@@ -278,69 +270,65 @@ export default function HoneycombChatPage() {
 
       {/* ----------------- THREAD PANEL ----------------- */}
       {activeThreadMessageID && (
-        <div className="fixed right-0 top-0 h-full w-96 bg-white border-l border-gray-300 p-4 shadow-lg flex flex-col z-50">
-          <button
-            className="bg-yellow-400 px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700 mb-3"
-            onClick={() => setActiveThreadMessageID(null)}
-          >
-            Close
-          </button>
+        <ThreadPanel
+          activeThreadMessageID={activeThreadMessageID}
+          threads={threads}
+          messages={messages}
+          onClose={() => setActiveThreadMessageID(null)}
+          onSend={handleSendThread}
+          hiveID={hiveID}
+          honeycombID={honeycombID}
+          user={user}
+        />
+      )}
+    </div>
+  );
+}
 
-          <div className="flex-1 overflow-y-auto">
-            <p className="font-bold mb-2 text-gray-900">
-              {messages.find((m) => m.id === activeThreadMessageID)?.text}
-            </p>
+function ThreadPanel({ activeThreadMessageID, threads, messages, onClose, onSend, hiveID, honeycombID, user }) {
+  const currentThread = threads[activeThreadMessageID] || [];
+  const parentMessage = messages.find(m => m.id === activeThreadMessageID);
 
-            <p className="text-xs font-semibold mb-2">
-              Status:{" "}
-              <span
-                className={
-                  threads[activeThreadMessageID]?.[0]?.status === "closed"
-                    ? "text-red-600 font-bold"
-                    : "text-green-600 font-bold"
-                }
-              >
-                {threads[activeThreadMessageID]?.[0]?.status?.toUpperCase() || "OPEN"}
-              </span>
-            </p>
+  return (
+    <div className="fixed right-0 top-0 h-full w-96 bg-white border-l border-gray-300 p-4 shadow-lg flex flex-col z-50">
+      <button
+        className="bg-yellow-400 px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700 mb-3"
+        onClick={onClose}
+      >
+        Close
+      </button>
 
-            {(threads[activeThreadMessageID] || []).map((thread) => (
-              <div
-                key={thread.id}
-                className="mb-2 p-2 bg-gray-100 rounded-md border border-gray-300"
-              >
-                <p className="text-xs font-semibold text-gray-800">{thread.sender}</p>
-                <p className="text-sm text-gray-900 break-words">{thread.text}</p>
-              </div>
-            ))}
+      <div className="flex-1 overflow-y-auto">
+        <p className="font-bold mb-2 text-gray-900">{parentMessage?.text}</p>
+
+        <p className="text-xs font-semibold mb-2">
+          Status:{" "}
+          <span className={currentThread[0]?.status === "closed" ? "text-red-600 font-bold" : "text-green-600 font-bold"}>
+            {currentThread[0]?.status?.toUpperCase() || "OPEN"}
+          </span>
+        </p>
+
+        {currentThread.map(thread => (
+          <div key={thread.id} className="mb-2 p-2 bg-gray-100 rounded-md border border-gray-300">
+            <p className="text-xs font-semibold text-gray-800">{thread.sender}</p>
+            <p className="text-sm text-gray-900 break-words">{thread.text}</p>
           </div>
+        ))}
+      </div>
 
-          <ThreadInput
-            parentMessageID={activeThreadMessageID}
-            onSend={handleSendThread}
-          />
+      <ThreadInput parentMessageID={activeThreadMessageID} onSend={onSend} />
 
-          {threads[activeThreadMessageID]?.[0]?.senderId === user.uid && (
-            <button
-              onClick={async () => {
-                const currentStatus = threads[activeThreadMessageID][0].status;
-                const newStatus = currentStatus === "open" ? "closed" : "open";
-                await setThreadStatus(
-                  hiveID,
-                  honeycombID,
-                  activeThreadMessageID,
-                  threads[activeThreadMessageID][0].id,
-                  newStatus
-                );
-              }}
-              className="mt-2 px-4 py-2 bg-yellow-400 text-white rounded-md font-semibold hover:bg-yellow-500"
-            >
-              {threads[activeThreadMessageID]?.[0]?.status === "open"
-                ? "Close Thread"
-                : "Reopen Thread"}
-            </button>
-          )}
-        </div>
+      {currentThread[0]?.senderId === user.uid && (
+        <button
+          onClick={async () => {
+            const currentStatus = currentThread[0].status;
+            const newStatus = currentStatus === "open" ? "closed" : "open";
+            await setThreadStatus(hiveID, honeycombID, activeThreadMessageID, currentThread[0].id, newStatus);
+          }}
+          className="mt-2 px-4 py-2 bg-yellow-400 text-white rounded-md font-semibold hover:bg-yellow-500"
+        >
+          {currentThread[0]?.status === "open" ? "Close Thread" : "Reopen Thread"}
+        </button>
       )}
     </div>
   );
@@ -348,12 +336,14 @@ export default function HoneycombChatPage() {
 
 function ThreadInput({ parentMessageID, onSend }) {
   const [text, setText] = useState("");
+
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!text.trim()) return;
     onSend(text, parentMessageID);
     setText("");
   };
+
   return (
     <form onSubmit={handleSubmit} className="flex mt-2">
       <input
@@ -362,10 +352,7 @@ function ThreadInput({ parentMessageID, onSend }) {
         placeholder="Reply in thread..."
         className="flex-1 border border-gray-300 rounded-md p-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400"
       />
-      <button
-        type="submit"
-        className="ml-1 px-3 py-1 bg-yellow-400 text-white rounded-md text-sm font-semibold hover:bg-yellow-500"
-      >
+      <button type="submit" className="ml-1 px-3 py-1 bg-yellow-400 text-white rounded-md text-sm font-semibold hover:bg-yellow-500">
         Reply
       </button>
     </form>
