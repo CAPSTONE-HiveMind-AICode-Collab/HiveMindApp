@@ -1,6 +1,6 @@
 // src/lib/firebase/config.js
 import { initializeApp } from "firebase/app";
-import { getAI, getGenerativeModel, GoogleAIBackend } from "firebase/ai";
+import { getAI, getGenerativeModel} from "firebase/ai";
 import { getAuth, GoogleAuthProvider } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 

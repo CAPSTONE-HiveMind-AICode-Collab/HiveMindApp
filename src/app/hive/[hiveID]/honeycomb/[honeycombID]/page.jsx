@@ -11,6 +11,7 @@ import {
   getThreadUnreadCount,
   getHoneycombUnreadCount,
   setThreadStatus,
+  closeThreadAndNotify,
 } from "@/lib/business/chatService";
 import { useUser } from "@/lib/auth/userContext";
 import { callGeminiAPI } from "@/lib/data/aiRepository";
@@ -322,10 +323,25 @@ function ThreadPanel({ activeThreadMessageID, threads, messages, onClose, onSend
         <button
           onClick={async () => {
             const currentStatus = currentThread[0].status;
-            const newStatus = currentStatus === "open" ? "closed" : "open";
-            await setThreadStatus(hiveID, honeycombID, activeThreadMessageID, currentThread[0].id, newStatus);
+            if (currentStatus === "open") {
+              // 🔔 Close and notify all participants
+              await closeThreadAndNotify(
+                hiveID,
+                honeycombID,
+                activeThreadMessageID,
+                currentThread[0].id,
+                user
+              );
+            } else {
+              // 🔓 Reopen (no notifications)
+              await setThreadStatus(hiveID, honeycombID, activeThreadMessageID, currentThread[0].id, "open");
+            }
           }}
-          className="mt-2 px-4 py-2 bg-yellow-400 text-white rounded-md font-semibold hover:bg-yellow-500"
+          className={`mt-2 px-4 py-2 rounded-md font-semibold ${
+            currentThread[0]?.status === "open"
+              ? "bg-red-500 text-white hover:bg-red-600"
+              : "bg-green-500 text-white hover:bg-green-600"
+          }`}
         >
           {currentThread[0]?.status === "open" ? "Close Thread" : "Reopen Thread"}
         </button>

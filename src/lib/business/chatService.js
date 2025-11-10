@@ -16,6 +16,10 @@ import {
 import { db, model } from "@/lib/firebase/config"; 
 import { useUser } from "../auth/userContext";
 import { callGeminiAPI } from "@/lib/data/aiRepository";
+import { updateThreadStatus, getThreadParticipants } from "@/lib/data/firestoreRepository";
+import { scheduleTimeBasedNotification, notifyUsers } from "@/lib/business/notificationService";
+/* ----------------- Notifications -----------------*/
+
 
 /* ----------------- USER MESSAGES ----------------- */
 
@@ -258,4 +262,58 @@ export async function setThreadStatus(hiveID, honeycombID, parentMessageID, thre
   if (!["open", "closed"].includes(status)) throw new Error("Invalid status");
   const threadRef = doc(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", parentMessageID, "Threads", threadID);
   await setDoc(threadRef, { status }, { merge: true });
+}
+
+/* ----------------- THREAD CLOSING + NOTIFICATIONS ----------------- */
+
+/**
+ * Close a thread and notify all participants immediately
+ */
+export async function closeThreadAndNotify(
+  hiveID,
+  honeycombID,
+  parentMessageID,
+  threadID,
+  closedByUser
+) {
+  try {
+    // 1️⃣ Update thread status to "closed"
+    await updateThreadStatus(hiveID, honeycombID, parentMessageID, threadID, "closed");
+
+    // 2️⃣ Get participants
+    const participants = await getThreadParticipants(hiveID, honeycombID, parentMessageID, threadID);
+
+    if (!participants || participants.length === 0) {
+      console.warn("⚠️ No participants found for thread:", threadID);
+      return;
+    }
+
+    // 3️⃣ Extract UIDs only (avoid object vs string issues)
+    const userIDs = participants
+      .map((p) => (typeof p === "string" ? p : p?.uid))
+      .filter(Boolean);
+
+    if (userIDs.length === 0) {
+      console.warn("⚠️ No valid user IDs to notify for thread:", threadID);
+      return;
+    }
+
+    // 4️⃣ Build notification message
+    const message = `Thread "${threadID}" was closed by ${closedByUser?.displayName || "a user"}.`;
+
+    // 5️⃣ Notify all participants immediately
+    await notifyUsers(userIDs, {
+      type: "THREAD_CLOSED",
+      hiveID,
+      honeycombID,
+      threadID,
+      message,
+      notifyAt: null, // Not time-based; show immediately
+    });
+
+    console.log(`✅ THREAD_CLOSED notifications sent to:`, userIDs);
+
+  } catch (error) {
+    console.error("❌ Failed to close thread and notify participants:", error);
+  }
 }
