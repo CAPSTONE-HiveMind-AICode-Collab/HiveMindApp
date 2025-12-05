@@ -1,0 +1,126 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function getUserId() {
+      return request.auth.uid;
+    }
+    
+    // File size limits (in bytes)
+    function isValidImageSize() {
+      return request.resource.size < 5 * 1024 * 1024; // 5MB
+    }
+    
+    function isValidDocumentSize() {
+      return request.resource.size < 10 * 1024 * 1024; // 10MB
+    }
+    
+    function isValidVideoSize() {
+      return request.resource.size < 50 * 1024 * 1024; // 50MB
+    }
+    
+    // Content type validation
+    function isImage() {
+      return request.resource.contentType.matches('image/.*');
+    }
+    
+    function isDocument() {
+      return request.resource.contentType.matches('application/pdf')
+        || request.resource.contentType.matches('application/msword')
+        || request.resource.contentType.matches('application/vnd.openxmlformats-officedocument.*')
+        || request.resource.contentType.matches('text/plain');
+    }
+    
+    function isVideo() {
+      return request.resource.contentType.matches('video/.*');
+    }
+    
+    function isAllowedFileType() {
+      return isImage() || isDocument() || isVideo();
+    }
+    
+    function isValidFileSize() {
+      return (isImage() && isValidImageSize())
+        || (isDocument() && isValidDocumentSize())
+        || (isVideo() && isValidVideoSize());
+    }
+    
+    // Check if user is hive member (requires Firestore access)
+    function isHiveMember(hiveID) {
+      return isSignedIn() 
+        && getUserId() in firestore.get(/databases/(default)/documents/Hive/$(hiveID)).data.members;
+    }
+    
+    // ==================== USER PROFILE PICTURES ====================
+    match /users/{userID}/profile/{fileName} {
+      // Users can upload their own profile picture
+      allow create, update: if isSignedIn() 
+        && userID == getUserId()
+        && isImage()
+        && isValidImageSize();
+      
+      // Anyone can read profile pictures (public)
+      allow read: if true;
+      
+      // Users can delete their own profile pictures
+      allow delete: if isSignedIn() && userID == getUserId();
+    }
+    
+    // ==================== HIVE ATTACHMENTS ====================
+    match /hives/{hiveID}/attachments/{honeycombID}/{messageID}/{fileName} {
+      // Hive members can upload files to messages
+      allow create: if isHiveMember(hiveID)
+        && isAllowedFileType()
+        && isValidFileSize();
+      
+      // Hive members can read attachments
+      allow read: if isHiveMember(hiveID);
+      
+      // File uploader or hive owner can delete
+      allow delete: if isHiveMember(hiveID)
+        && (resource.metadata.uploadedBy == getUserId() 
+            || firestore.get(/databases/(default)/documents/Hive/$(hiveID)).data.ownerId == getUserId());
+    }
+    
+    // ==================== SHARED FILES ====================
+    match /shared/{hiveID}/{fileName} {
+      // Members can upload shared files (documents, resources)
+      allow create: if isHiveMember(hiveID)
+        && isAllowedFileType()
+        && isValidFileSize();
+      
+      // Members can read shared files
+      allow read: if isHiveMember(hiveID);
+      
+      // Uploader or owner can delete
+      allow delete: if isHiveMember(hiveID)
+        && (resource.metadata.uploadedBy == getUserId()
+            || firestore.get(/databases/(default)/documents/Hive/$(hiveID)).data.ownerId == getUserId());
+    }
+    
+    // ==================== TEMPORARY UPLOADS ====================
+    match /temp/{userID}/{fileName} {
+      // Users can upload to their temp folder (cleanup via Cloud Functions after 24h)
+      allow create, update: if isSignedIn() 
+        && userID == getUserId()
+        && isValidFileSize();
+      
+      // Users can read their own temp files
+      allow read: if isSignedIn() && userID == getUserId();
+      
+      // Users can delete their own temp files
+      allow delete: if isSignedIn() && userID == getUserId();
+    }
+    
+    // Block all other paths
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
