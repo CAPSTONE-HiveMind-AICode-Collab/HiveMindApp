@@ -18,11 +18,8 @@ import { useUser } from "../auth/userContext";
 import { callGeminiAPI } from "@/lib/data/aiRepository";
 import { updateThreadStatus, getThreadParticipants } from "@/lib/data/firestoreRepository";
 import { scheduleTimeBasedNotification, notifyUsers } from "@/lib/business/notificationService";
-<<<<<<< HEAD
 import { generateAndStoreThreadSummary } from "@/lib/data/summaryRepository";
-=======
 import { isToxicMessage } from "@/lib/business/ToxicityService";
->>>>>>> b1b2260d684a6b03d598c16a3ea63a97e5935646
 /* ----------------- Notifications -----------------*/
 
 
