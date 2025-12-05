@@ -1,115 +1,176 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useUser } from "@/lib/auth/userContext";
+
 import NotificationCreator from "@/components/notificationCreator";
+<<<<<<< HEAD
+import NotificationPrompt from "@/components/NotificationPrompt";
+import NotificationsPanel from "@/components/notificationPanel";
+=======
+
+>>>>>>> b1b2260d684a6b03d598c16a3ea63a97e5935646
 import {
   listenToNotifications,
   pollTimeBasedNotifications,
   markNotificationRead,
 } from "@/lib/business/notificationService";
-import { deleteNotification } from "@/lib/data/firestoreRepository"; // Make sure this exists
+
+import { deleteNotification } from "@/lib/data/firestoreRepository";
+
+import { loadToxicityModel } from "@/lib/business/ToxicityService";
 
 export default function ClientLayout({ children }) {
   const { user, loading } = useUser();
   const router = useRouter();
+<<<<<<< HEAD
+  const [creatorOpen, setCreatorOpen] = useState(false);
+
+  if (loading) return <p>Loading user info...</p>;
+
+  return (
+    <div className="relative min-h-screen">
+      {/* Use the NotificationsPanel component instead of custom notification UI */}
+      <NotificationsPanel />
+
+      {/* Use the NotificationsPanel component instead of custom notification UI */}
+      <NotificationsPanel />
+
+      {/* Notification Permission Prompt */}
+      <NotificationPrompt />
+=======
+
   const [notifications, setNotifications] = useState([]);
   const [panelOpen, setPanelOpen] = useState(false);
   const [creatorOpen, setCreatorOpen] = useState(false);
 
-  // Helper: format timestamps
+  // ---------------------------------------------------------------------
+  // Format Firestore timestamps
+  // ---------------------------------------------------------------------
   const formatTimestamp = (ts) => {
     if (!ts) return "No date";
     if (ts.seconds) return new Date(ts.seconds * 1000).toLocaleString();
     return new Date(ts).toLocaleString();
   };
 
-  // ---------------- Real-time listener for all notifications ----------------
+  // ---------------------------------------------------------------------
+  // Toxicity Model Warm-Up (Runs on App Load)
+  // ---------------------------------------------------------------------
+  useEffect(() => {
+    loadToxicityModel()
+      .then(() => console.log("✓ Toxicity model preloaded"))
+      .catch((err) => console.error("Model warm-up failed:", err));
+  }, []);
+
+  // ---------------------------------------------------------------------
+  // Real-Time Firestore Listener
+  // ---------------------------------------------------------------------
   useEffect(() => {
     if (!user) return;
 
-    const unsubscribe = listenToNotifications(user.uid, (allNotifs) => {
+    const unsub = listenToNotifications(user.uid, (all) => {
       const now = new Date();
 
-      // Show THREAD_CLOSED immediately, TIME_BASED only if due
-      const visible = allNotifs.filter((n) => {
+      const filtered = all.filter((n) => {
         if (n.type === "THREAD_CLOSED") return true;
         if (n.type !== "TIME_BASED") return true;
+
         if (!n.notifyAt) return true;
         return new Date(n.notifyAt) <= now;
       });
 
-      const sorted = visible.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-      setNotifications(sorted);
+      filtered.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+      setNotifications(filtered);
     });
 
-    return () => unsubscribe?.();
+    return () => unsub?.();
   }, [user]);
 
-  // ---------------- Poll for TIME_BASED notifications as backup ----------------
+  // ---------------------------------------------------------------------
+  // 30-second Polling Backup for TIME_BASED Notifications
+  // ---------------------------------------------------------------------
   useEffect(() => {
     if (!user) return;
 
     const interval = setInterval(async () => {
       try {
         const due = await pollTimeBasedNotifications(user.uid);
-        if (due.length > 0) {
-          setNotifications((prev) => {
-            const merged = [...prev];
-            for (const n of due) {
-              if (!merged.some((m) => m.id === n.id)) merged.unshift(n);
-            }
-            return merged.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-          });
-        }
+        if (due.length === 0) return;
+
+        setNotifications((prev) => {
+          const merged = [...prev];
+          for (const n of due) {
+            if (!merged.some((m) => m.id === n.id)) merged.unshift(n);
+          }
+          return merged.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+        });
       } catch (err) {
-        console.error("Failed to poll TIME_BASED notifications:", err);
+        console.error("TIME_BASED poll failed:", err);
       }
-    }, 30000); // every 30s
+    }, 30000);
 
     return () => clearInterval(interval);
   }, [user]);
 
-  // ---------------- Mark notification as read ----------------
-  const handleMarkRead = async (notif) => {
-    if (!user) return;
-    try {
-      await markNotificationRead(user.uid, notif.id);
-      setNotifications((prev) =>
-        prev.map((n) => (n.id === notif.id ? { ...n, read: true } : n))
-      );
+  // ---------------------------------------------------------------------
+  // Mark Notification as Read
+  // ---------------------------------------------------------------------
+  const handleMarkRead = useCallback(
+    async (notif) => {
+      if (!user) return;
 
-      // Navigate if THREAD_CLOSED
-      if (notif.type === "THREAD_CLOSED") {
-        const { hiveID, honeycombID, threadID } = notif;
-        if (hiveID && honeycombID && threadID) {
-          router.push(`/hive/${hiveID}/honeycomb/${honeycombID}?thread=${threadID}`);
+      try {
+        await markNotificationRead(user.uid, notif.id);
+
+        setNotifications((prev) =>
+          prev.map((n) => (n.id === notif.id ? { ...n, read: true } : n))
+        );
+
+        // Navigate if THREAD_CLOSED
+        if (notif.type === "THREAD_CLOSED") {
+          const { hiveID, honeycombID, threadID } = notif;
+          if (hiveID && honeycombID && threadID) {
+            router.push(`/hive/${hiveID}/honeycomb/${honeycombID}?thread=${threadID}`);
+          }
         }
+      } catch (err) {
+        console.error("Mark read failed:", err);
       }
-    } catch (err) {
-      console.error("Failed to mark notification as read:", err);
-    }
-  };
+    },
+    [user, router]
+  );
 
-  // ---------------- Delete notification ----------------
-  const handleDeleteNotification = async (notifID) => {
-    if (!user) return;
-    try {
-      await deleteNotification(user.uid, notifID); // Firestore delete
-      setNotifications((prev) => prev.filter((n) => n.id !== notifID)); // remove from UI
-    } catch (err) {
-      console.error("Failed to delete notification:", err);
-    }
-  };
+  // ---------------------------------------------------------------------
+  // Delete Notification
+  // ---------------------------------------------------------------------
+  const handleDeleteNotification = useCallback(
+    async (notifID) => {
+      if (!user) return;
 
-  if (loading) return <p>Loading user info...</p>;
+      try {
+        await deleteNotification(user.uid, notifID);
+        setNotifications((prev) => prev.filter((n) => n.id !== notifID));
+      } catch (err) {
+        console.error("Notification delete failed:", err);
+      }
+    },
+    [user]
+  );
+
+  // ---------------------------------------------------------------------
+  // Loading state
+  // ---------------------------------------------------------------------
+  if (loading) return <p>Loading...</p>;
 
   const unreadCount = notifications.filter((n) => !n.read).length;
 
+  // ---------------------------------------------------------------------
+  // JSX UI
+  // ---------------------------------------------------------------------
   return (
     <div className="relative min-h-screen">
-      {/* Notification Bell */}
+      {/* Bell icon */}
       <div className="fixed top-4 right-4 z-50">
         <div className="relative">
           <button
@@ -127,7 +188,7 @@ export default function ClientLayout({ children }) {
           {/* Notification Panel */}
           {panelOpen && (
             <div className="absolute right-0 mt-2 w-80 bg-white border border-gray-300 rounded shadow-lg overflow-hidden z-50">
-              {/* Create Notification Button */}
+              {/* Creator toggle */}
               <div
                 className="px-4 py-2 border-b border-gray-200 hover:bg-gray-100 cursor-pointer text-blue-600 font-semibold"
                 onClick={() => setCreatorOpen((prev) => !prev)}
@@ -135,7 +196,7 @@ export default function ClientLayout({ children }) {
                 Create Notification
               </div>
 
-              {/* Notification List */}
+              {/* List */}
               {notifications.length === 0 ? (
                 <p className="px-4 py-2 text-gray-500 text-sm">No notifications</p>
               ) : (
@@ -146,20 +207,15 @@ export default function ClientLayout({ children }) {
                       notif.read ? "opacity-60" : "font-semibold"
                     }`}
                   >
-                    {/* Notification text */}
-                    <div
-                      className="flex-1 mr-2"
-                      onClick={() => handleMarkRead(notif)}
-                    >
+                    <div className="flex-1 mr-2" onClick={() => handleMarkRead(notif)}>
                       <p className="text-sm text-gray-800">{notif.message}</p>
                       <small className="text-gray-400 text-xs">
                         {formatTimestamp(notif.timestamp)}
                       </small>
                     </div>
 
-                    {/* Delete button */}
                     <button
-                      className="flex-shrink-0 text-red-500 hover:text-red-700 text-sm p-1 ml-2"
+                      className="text-red-500 hover:text-red-700 text-sm p-1 ml-2"
                       onClick={(e) => {
                         e.stopPropagation();
                         handleDeleteNotification(notif.id);
@@ -186,8 +242,8 @@ export default function ClientLayout({ children }) {
           />
         </div>
       )}
+>>>>>>> b1b2260d684a6b03d598c16a3ea63a97e5935646
 
-      {/* Render children */}
       <div>{children}</div>
     </div>
   );
