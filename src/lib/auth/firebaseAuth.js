@@ -11,6 +11,8 @@ export function listenToAuthChanges(callback) {
     if (firebaseUser) {
       const { uid, displayName, email } = firebaseUser;
 
+      console.info("[auth] onAuthStateChanged - signed in:", { uid, email });
+
       try {
         // Reference to Users collection
         const userRef = doc(db, "Users", uid);
