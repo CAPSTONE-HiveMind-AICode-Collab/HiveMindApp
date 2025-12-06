@@ -46,7 +46,6 @@ export async function POST(req) {
       );
     }
 
-    // pdf-parse is CommonJS; dynamic import works fine in Node runtime
     const pdfParseModule = await import("pdf-parse");
     const pdfParse = pdfParseModule.default || pdfParseModule;
 
