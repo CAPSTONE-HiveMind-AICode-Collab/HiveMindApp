@@ -40,10 +40,29 @@ function isQuotaError(e) {
   );
 }
 
+// only allow models your UI supports
+const ALLOWED_MODELS = new Set([
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-pro",
+]);
+
+function normalizeModelName(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return "";
+
+  // strip REST-style prefix if it comes in
+  const cleaned = raw.replace(/^models\//, "");
+
+ 
+  return cleaned;
+}
+
 export async function POST(req) {
   // IMPORTANT: Only read req.json() ONCE
   const payload = await req.json().catch(() => ({}));
-  const message = typeof payload?.message === "string" ? payload.message.trim() : "";
+  const message =
+    typeof payload?.message === "string" ? payload.message.trim() : "";
   const requestedModel = payload?.model;
 
   if (!message) {
@@ -61,12 +80,15 @@ export async function POST(req) {
     process.env.AI_DEMO === "1" ||
     process.env.AI_DEMO === "true";
 
-  // Model routing (teammate-compatible)
-  const modelName =
-    requestedModel ||
-    process.env.GENAI_MODEL ||
-    process.env.GEMINI_MODEL ||
-    "gemini-1.5-flash";
+  // Model routing (sanitized + allowlist + better default)
+  const envModel =
+    process.env.GENAI_MODEL || process.env.GEMINI_MODEL || "";
+
+  const candidate = normalizeModelName(requestedModel || envModel);
+
+  const modelName = ALLOWED_MODELS.has(candidate)
+    ? candidate
+    : "gemini-2.5-flash"; // new default
 
   // 1) Primary: Gemini via official Node SDK (@google/genai) if api key exists
   if (apiKey) {
@@ -83,7 +105,7 @@ export async function POST(req) {
     } catch (err) {
       const e = extractGeminiError(err);
 
-      // Preserve teammate behavior: surface quota as 429 (client shows friendly message)
+      
       if (isQuotaError(e)) {
         return NextResponse.json(
           {
@@ -101,7 +123,6 @@ export async function POST(req) {
         );
       }
 
-      // If GenAI call failed for non-quota reasons, log and fall through to other options
       console.error("GenAI (GoogleGenAI) error:", err);
     }
   }
@@ -112,10 +133,11 @@ export async function POST(req) {
       reply: `Demo AI: ${message}`,
       demo: true,
       provider: "demo",
+      model: modelName,
     });
   }
 
-  // 3) Firebase model fallback (if your project had it earlier)
+  // Firebase model fallback
   // We import dynamically to reduce server bundling issues.
   try {
     const mod = await import("@/lib/firebase/config");
@@ -129,13 +151,13 @@ export async function POST(req) {
           ? response.text()
           : result?.text || "AI did not respond.";
 
-      return NextResponse.json({ reply, provider: "firebase" });
+      return NextResponse.json({ reply, provider: "firebase", model: modelName });
     }
   } catch (e) {
     console.warn("Firebase model fallback not available:", e?.message || e);
   }
 
-  // 4) No provider configured
+  // No provider configured
   if (!apiKey) {
     return NextResponse.json(
       {
