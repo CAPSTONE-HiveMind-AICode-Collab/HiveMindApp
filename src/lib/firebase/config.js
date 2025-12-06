@@ -1,13 +1,12 @@
-// src/lib/firebase/config.js
 import { initializeApp, getApps } from "firebase/app";
 import { getAuth, GoogleAuthProvider } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
-<<<<<<< HEAD
-=======
 import { getPerformance } from "firebase/performance";
 import { initializeAppCheck, ReCaptchaV3Provider } from "firebase/app-check";
->>>>>>> 789492608f754fef08bf36f559232de36e1792b4
+
+
+import { getAI, getGenerativeModel } from "firebase/ai";
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -23,36 +22,34 @@ export const firebaseApp =
 
 export const auth = getAuth(firebaseApp);
 export const provider = new GoogleAuthProvider();
-<<<<<<< HEAD
+
+
 export const db = getFirestore(firebaseApp);
-export const storage = getStorage(firebaseApp);
-=======
+
 export const storage = getStorage(firebaseApp);
 
-// Initialize Performance Monitoring
-let perf;
-if (typeof window !== 'undefined') {
-  perf = getPerformance(firebaseApp);
-}
-export const performance = perf;
+// Performance (client-only)
+export const performance =
+  typeof window !== "undefined" ? getPerformance(firebaseApp) : null;
 
-// Initialize App Check (bot protection)
-let appCheck;
-if (typeof window !== 'undefined' && process.env.NEXT_PUBLIC_FIREBASE_APP_CHECK_KEY) {
+// App Check (client-only)
+export const appCheckInstance =
+  typeof window !== "undefined" && process.env.NEXT_PUBLIC_FIREBASE_APP_CHECK_KEY
+    ? initializeAppCheck(firebaseApp, {
+        provider: new ReCaptchaV3Provider(process.env.NEXT_PUBLIC_FIREBASE_APP_CHECK_KEY),
+        isTokenAutoRefreshEnabled: true,
+      })
+    : null;
+
+
+export const ai = (() => {
   try {
-    appCheck = initializeAppCheck(firebaseApp, {
-      provider: new ReCaptchaV3Provider(process.env.NEXT_PUBLIC_FIREBASE_APP_CHECK_KEY),
-      isTokenAutoRefreshEnabled: true
-    });
-    console.log('App Check initialized');
-  } catch (error) {
-    console.warn('App Check initialization failed:', error);
+    return getAI(firebaseApp);
+  } catch {
+    return null;
   }
-}
-export const appCheckInstance = appCheck;
+})();
 
-// Initialize AI
-export const ai = getAI(firebaseApp);
-export const model = getGenerativeModel(ai, { model: "gemini-2.5-flash-lite"})
-
->>>>>>> 789492608f754fef08bf36f559232de36e1792b4
+export const model = ai
+  ? getGenerativeModel(ai, { model: "gemini-2.5-flash-lite" })
+  : null;
