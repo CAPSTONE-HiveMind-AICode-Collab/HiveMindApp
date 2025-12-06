@@ -19,6 +19,12 @@ import { useUser } from "../auth/userContext";
 import { callGeminiAPI } from "@/lib/data/aiRepository";
 import { updateThreadStatus, getThreadParticipants } from "@/lib/data/firestoreRepository";
 import { scheduleTimeBasedNotification, notifyUsers } from "@/lib/business/notificationService";
+<<<<<<< HEAD
+=======
+import { generateAndStoreThreadSummary } from "@/lib/data/summaryRepository";
+import { isToxicMessage } from "@/lib/business/ToxicityService";
+/* ----------------- Notifications -----------------*/
+>>>>>>> 789492608f754fef08bf36f559232de36e1792b4
 
 /* ----------------- Helpers ----------------- */
 
@@ -40,7 +46,38 @@ const normalizeAttachment = (attachment) => {
 };
 
 /* ----------------- USER MESSAGES ----------------- */
+export function useSendUserMessage() {
+  const { user } = useUser();
 
+  const sendMessage = async (text, hiveID, honeycombID) => {
+    if (!user) throw new Error("User not authenticated");
+
+    // 1️⃣ Local Tensor model toxicity check
+    const toxic = await isToxicMessage(text);
+    if (toxic) {
+       alert("Your message appears toxic — please revise and try again.");
+       return;
+    }
+
+    // 2️⃣ Save to Firestore normally
+    const messagesRef = collection(
+      db, "Hive", hiveID, "Honeycomb", honeycombID, "messages"
+    );
+
+    await addDoc(messagesRef, {
+      text,
+      sender: user.displayName,
+      senderId: user.uid,
+      timestamp: serverTimestamp(),
+    });
+  };
+
+  return sendMessage;
+}
+
+
+
+/*
 export function useSendUserMessage() {
   const { user } = useUser();
 
@@ -87,8 +124,32 @@ export function useSendUserMessage() {
   };
 
   return sendMessage;
+}*/
+
+export function subscribeToChatMessages(callback, hiveID, honeycombID, messageLimit = 50) {
+  const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
+  const q = query(messagesRef, orderBy("timestamp", "desc"), limit(messageLimit));
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const msgs = snapshot.docs
+        .map((doc) => ({ id: doc.id, ...doc.data() }))
+        .reverse(); // Reverse to show oldest first
+      callback(msgs);
+    },
+    (err) => {
+      // Log permission or other snapshot errors and provide an empty result to the callback
+      console.error("subscribeToChatMessages snapshot error:", err);
+      try {
+        callback([]);
+      } catch (e) {
+        // swallow
+      }
+    }
+  );
 }
 
+<<<<<<< HEAD
 export function subscribeToChatMessages(callback, hiveID, honeycombID) {
   if (!hiveID || !honeycombID) {
     console.warn("subscribeToChatMessages missing IDs:", { hiveID, honeycombID });
@@ -105,10 +166,29 @@ export function subscribeToChatMessages(callback, hiveID, honeycombID) {
     const msgs = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
     callback(msgs);
   });
+=======
+/**
+ * Load older messages for pagination
+ * Returns messages older than the oldest current message
+ */
+export async function loadOlderMessages(hiveID, honeycombID, oldestTimestamp, messageLimit = 50) {
+  const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
+  const q = query(
+    messagesRef, 
+    orderBy("timestamp", "desc"), 
+    where("timestamp", "<", oldestTimestamp),
+    limit(messageLimit)
+  );
+  
+  const snapshot = await getDocs(q);
+  return snapshot.docs
+    .map((doc) => ({ id: doc.id, ...doc.data() }))
+    .reverse(); // Reverse to show oldest first
+>>>>>>> 789492608f754fef08bf36f559232de36e1792b4
 }
 
 /* ----------------- THREADS ----------------- */
-
+/*
 export function useSendThreadMessage() {
   const { user } = useUser();
 
@@ -156,6 +236,38 @@ export function useSendThreadMessage() {
 
   return sendThread;
 }
+  */
+
+export function useSendThreadMessage() {
+  const { user } = useUser();
+
+  const sendThreadMessage = async (text, hiveID, honeycombID, parentMessageID) => {
+    if (!user) throw new Error("User not authenticated");
+
+    // 1️⃣ Tensor toxicity model
+    const toxic = await isToxicMessage(text);
+    if (toxic) {
+       alert("Your message appears toxic — please revise and try again.");
+       return;
+    }
+
+    // 2️⃣ Add reply normally
+    const ref = collection(
+      db, "Hive", hiveID, "Honeycomb", honeycombID, "messages",
+      parentMessageID, "Threads"
+    );
+
+    await addDoc(ref, {
+      text,
+      sender: user.displayName,
+      senderId: user.uid,
+      timestamp: serverTimestamp(),
+      parentMessageId: parentMessageID,
+    });
+  };
+
+  return sendThreadMessage;
+}
 
 export function subscribeToThreadMessages(callback, hiveID, honeycombID, parentMessageID) {
   if (!hiveID || !honeycombID || !parentMessageID) {
@@ -169,6 +281,7 @@ export function subscribeToThreadMessages(callback, hiveID, honeycombID, parentM
 
   const threadRef = collection(db, "Hive", hid, "Honeycomb", cid, "messages", pid, "Threads");
   const q = query(threadRef, orderBy("timestamp", "asc"));
+<<<<<<< HEAD
 
   return onSnapshot(q, (snapshot) => {
     const threads = snapshot.docs.map((d) => ({
@@ -178,6 +291,23 @@ export function subscribeToThreadMessages(callback, hiveID, honeycombID, parentM
     }));
     callback(threads);
   });
+=======
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const threads = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data(), status: doc.data().status || "open" }));
+      callback(threads);
+    },
+    (err) => {
+      console.error("subscribeToThreadMessages snapshot error:", err);
+      try {
+        callback([]);
+      } catch (e) {
+        // swallow
+      }
+    }
+  );
+>>>>>>> 789492608f754fef08bf36f559232de36e1792b4
 }
 
 /* ----------------- AI REPLIES ----------------- */
@@ -379,6 +509,26 @@ export async function closeThreadAndNotify(hiveID, honeycombID, parentMessageID,
       message,
       notifyAt: null,
     });
+<<<<<<< HEAD
+=======
+
+    console.log(`✅ THREAD_CLOSED notifications sent to:`, userIDs);
+
+    // 4️⃣ Generate and store AI summary for this completed thread
+    try {
+      await generateAndStoreThreadSummary(
+        hiveID,
+        honeycombID,
+        parentMessageID,
+        threadID,
+        closedByUser
+      );
+      console.log("✅ AI summary generated and stored for thread:", threadID);
+    } catch (err) {
+      console.error("❌ Failed to generate AI summary for thread:", err);
+    }
+
+>>>>>>> 789492608f754fef08bf36f559232de36e1792b4
   } catch (error) {
     console.error("❌ Failed to close thread and notify participants:", error);
   }
