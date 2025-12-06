@@ -13,46 +13,96 @@ import {
   serverTimestamp,
   where,
 } from "firebase/firestore";
-import { db, model } from "@/lib/firebase/config"; 
+
+import { db } from "@/lib/firebase/config"; //  removed model import
 import { useUser } from "../auth/userContext";
 import { callGeminiAPI } from "@/lib/data/aiRepository";
 import { updateThreadStatus, getThreadParticipants } from "@/lib/data/firestoreRepository";
 import { scheduleTimeBasedNotification, notifyUsers } from "@/lib/business/notificationService";
-/* ----------------- Notifications -----------------*/
 
+/* ----------------- Helpers ----------------- */
+
+const asId = (value, name) => {
+  if (value === undefined || value === null || value === "") {
+    throw new Error(`${name} is required`);
+  }
+  return String(value);
+};
+
+const normalizeUserIds = (allUserIds) =>
+  Array.isArray(allUserIds)
+    ? allUserIds.map((x) => (typeof x === "string" ? x : x?.uid)).filter(Boolean).map(String)
+    : [];
+
+const normalizeAttachment = (attachment) => {
+  if (!attachment) return null;
+  return Array.isArray(attachment) ? attachment : [attachment];
+};
 
 /* ----------------- USER MESSAGES ----------------- */
 
 export function useSendUserMessage() {
   const { user } = useUser();
 
-  const sendMessage = async (text, hiveID, honeycombID, allUserIds = []) => {
+  const sendMessage = async (text, hiveID, honeycombID, allUserIds = [], attachment = null) => {
     if (!user) throw new Error("User not authenticated");
 
-    const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
+    const hid = asId(hiveID, "hiveID");
+    const cid = asId(honeycombID, "honeycombID");
+
+    const messagesRef = collection(db, "Hive", hid, "Honeycomb", cid, "messages");
+
+    const normalized = normalizeAttachment(attachment);
+
     const msgRef = await addDoc(messagesRef, {
-      text,
-      sender: user.displayName,
+      type: normalized ? "file" : "text",
+      text: text || "",
+      attachment: normalized, // ✅ always array or null
+      sender: user.displayName || user.email || "User",
       senderId: user.uid,
       timestamp: serverTimestamp(),
     });
 
     // Initialize userStatus for all users (except sender)
-    allUserIds.forEach(async (uid) => {
+    const ids = normalizeUserIds(allUserIds);
+    ids.forEach(async (uid) => {
       if (uid === user.uid) return;
-      const statusRef = doc(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", msgRef.id, "userStatus", uid);
+
+      const statusRef = doc(
+        db,
+        "Hive",
+        hid,
+        "Honeycomb",
+        cid,
+        "messages",
+        msgRef.id,
+        "userStatus",
+        uid
+      );
+
       await setDoc(statusRef, { lastSeen: null });
     });
+
+    return msgRef.id;
   };
 
   return sendMessage;
 }
 
 export function subscribeToChatMessages(callback, hiveID, honeycombID) {
-  const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
+  if (!hiveID || !honeycombID) {
+    console.warn("subscribeToChatMessages missing IDs:", { hiveID, honeycombID });
+    return () => {};
+  }
+
+  const hid = String(hiveID);
+  const cid = String(honeycombID);
+
+  const messagesRef = collection(db, "Hive", hid, "Honeycomb", cid, "messages");
   const q = query(messagesRef, orderBy("timestamp", "asc"));
+
   return onSnapshot(q, (snapshot) => {
-    const msgs = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    const msgs = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
     callback(msgs);
   });
 }
@@ -65,58 +115,85 @@ export function useSendThreadMessage() {
   const sendThread = async (text, hiveID, honeycombID, parentMessageID, allUserIds = []) => {
     if (!user) throw new Error("User not authenticated");
 
-    const threadRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", parentMessageID, "Threads");
+    const hid = asId(hiveID, "hiveID");
+    const cid = asId(honeycombID, "honeycombID");
+    const pid = asId(parentMessageID, "parentMessageID");
+
+    const threadRef = collection(db, "Hive", hid, "Honeycomb", cid, "messages", pid, "Threads");
+
     const msgRef = await addDoc(threadRef, {
       text,
-      sender: user.displayName,
+      sender: user.displayName || user.email || "User",
       senderId: user.uid,
       timestamp: serverTimestamp(),
-      parentMessageId: parentMessageID,
+      parentMessageId: pid,
     });
 
     // Initialize userStatus for all users (except sender)
-    allUserIds.forEach(async (uid) => {
+    const ids = normalizeUserIds(allUserIds);
+    ids.forEach(async (uid) => {
       if (uid === user.uid) return;
+
       const statusRef = doc(
         db,
         "Hive",
-        hiveID,
+        hid,
         "Honeycomb",
-        honeycombID,
+        cid,
         "messages",
-        parentMessageID,
+        pid,
         "Threads",
         msgRef.id,
         "userStatus",
         uid
       );
+
       await setDoc(statusRef, { lastSeen: null });
     });
+
+    return msgRef.id;
   };
 
   return sendThread;
 }
 
 export function subscribeToThreadMessages(callback, hiveID, honeycombID, parentMessageID) {
-  const threadRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", parentMessageID, "Threads");
+  if (!hiveID || !honeycombID || !parentMessageID) {
+    console.warn("subscribeToThreadMessages missing IDs:", { hiveID, honeycombID, parentMessageID });
+    return () => {};
+  }
+
+  const hid = String(hiveID);
+  const cid = String(honeycombID);
+  const pid = String(parentMessageID);
+
+  const threadRef = collection(db, "Hive", hid, "Honeycomb", cid, "messages", pid, "Threads");
   const q = query(threadRef, orderBy("timestamp", "asc"));
+
   return onSnapshot(q, (snapshot) => {
-    const threads = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data(), status: doc.data().status || "open" }));
+    const threads = snapshot.docs.map((d) => ({
+      id: d.id,
+      ...d.data(),
+      status: d.data().status || "open",
+    }));
     callback(threads);
   });
 }
 
-
 /* ----------------- AI REPLIES ----------------- */
 
 export async function sendAIReply(text, hiveID, honeycombID) {
-  try {
-    // Call your Gemini AI model
-    const aiResponse = await callGeminiAPI(text); // or call directly via model if you want
+  const hid = asId(hiveID, "hiveID");
+  const cid = asId(honeycombID, "honeycombID");
 
-    const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
+  const messagesRef = collection(db, "Hive", hid, "Honeycomb", cid, "messages");
+
+  try {
+    const aiResponse = await callGeminiAPI(text);
+
     await addDoc(messagesRef, {
-      text: aiResponse, // save the actual AI reply
+      type: "text",
+      text: aiResponse,
       sender: "AI Bot",
       senderId: "AI",
       timestamp: serverTimestamp(),
@@ -124,9 +201,8 @@ export async function sendAIReply(text, hiveID, honeycombID) {
   } catch (error) {
     console.error("Failed to send AI reply:", error);
 
-    // Optional fallback message
-    const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
     await addDoc(messagesRef, {
+      type: "text",
       text: "AI could not generate a response.",
       sender: "AI Bot",
       senderId: "AI",
@@ -137,79 +213,95 @@ export async function sendAIReply(text, hiveID, honeycombID) {
 
 /* ----------------- UNREAD TRACKING ----------------- */
 
-/**
- * Update "last seen"
- * - Hive: updateLastSeen(hiveID, null, null, uid)
- * - Honeycomb: updateLastSeen(hiveID, honeycombID, null, uid)
- * - Thread: updateLastSeen(hiveID, honeycombID, messageID, uid)
- */
 export async function updateLastSeen(hiveID, honeycombID = null, messageID = null, uid) {
-  if (!hiveID) throw new Error("updateLastSeen: hiveID is required");
-  if (!uid) throw new Error("updateLastSeen: uid is required");
+  const hid = asId(hiveID, "hiveID");
+  const userId = asId(uid, "uid");
 
   let ref;
   if (messageID) {
-    ref = doc(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", messageID, "userStatus", uid);
+    if (!honeycombID) throw new Error("updateLastSeen: honeycombID is required when messageID is set");
+    ref = doc(
+      db,
+      "Hive",
+      hid,
+      "Honeycomb",
+      String(honeycombID),
+      "messages",
+      String(messageID),
+      "userStatus",
+      userId
+    );
   } else if (honeycombID) {
-    ref = doc(db, "Hive", hiveID, "Honeycomb", honeycombID, "userStatus", uid);
+    ref = doc(db, "Hive", hid, "Honeycomb", String(honeycombID), "userStatus", userId);
   } else {
-    ref = doc(db, "Hive", hiveID, "userStatus", uid);
+    ref = doc(db, "Hive", hid, "userStatus", userId);
   }
 
   await setDoc(ref, { lastSeen: serverTimestamp() }, { merge: true });
 }
 
-/**
- * Get "last seen" timestamp in ms
- */
 export async function getLastSeen(hiveID, honeycombID = null, messageID = null, uid) {
-  if (!hiveID || !uid) throw new Error("getLastSeen: hiveID and uid required");
+  const hid = asId(hiveID, "hiveID");
+  const userId = asId(uid, "uid");
 
   let ref;
   if (messageID) {
-    ref = doc(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", messageID, "userStatus", uid);
+    if (!honeycombID) throw new Error("getLastSeen: honeycombID is required when messageID is set");
+    ref = doc(
+      db,
+      "Hive",
+      hid,
+      "Honeycomb",
+      String(honeycombID),
+      "messages",
+      String(messageID),
+      "userStatus",
+      userId
+    );
   } else if (honeycombID) {
-    ref = doc(db, "Hive", hiveID, "Honeycomb", honeycombID, "userStatus", uid);
+    ref = doc(db, "Hive", hid, "Honeycomb", String(honeycombID), "userStatus", userId);
   } else {
-    ref = doc(db, "Hive", hiveID, "userStatus", uid);
+    ref = doc(db, "Hive", hid, "userStatus", userId);
   }
 
   const snap = await getDoc(ref);
   const lastSeen = snap.exists() ? snap.data()?.lastSeen : null;
-  return lastSeen?.toMillis?.() ?? 0; // default 0 if never opened
+  return lastSeen?.toMillis?.() ?? 0;
 }
 
-/**
- * Get latest message timestamp for a honeycomb or thread
- */
 export async function getLatestMessageTimestamp(hiveID, honeycombID, parentMessageID = null) {
   if (!hiveID || !honeycombID) return 0;
 
+  const hid = String(hiveID);
+  const cid = String(honeycombID);
+
   let ref;
   if (parentMessageID) {
-    ref = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", parentMessageID, "Threads");
+    ref = collection(db, "Hive", hid, "Honeycomb", cid, "messages", String(parentMessageID), "Threads");
   } else {
-    ref = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
+    ref = collection(db, "Hive", hid, "Honeycomb", cid, "messages");
   }
 
   const q = query(ref, orderBy("timestamp", "desc"), limit(1));
   const snap = await getDocs(q);
   if (snap.empty) return 0;
+
   const latest = snap.docs[0].data().timestamp;
   return latest?.toMillis?.() ?? 0;
 }
 
-/**
- * Return unread message count in Honeycomb or Thread
- */
 export async function getUnreadCount(hiveID, honeycombID, uid, parentMessageID = null) {
-  const lastSeenMs = await getLastSeen(hiveID, honeycombID, parentMessageID, uid);
+  const hid = asId(hiveID, "hiveID");
+  const cid = asId(honeycombID, "honeycombID");
+  const userId = asId(uid, "uid");
+
+  const lastSeenMs = await getLastSeen(hid, cid, parentMessageID ? String(parentMessageID) : null, userId);
 
   let ref;
   if (parentMessageID) {
-    ref = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", parentMessageID, "Threads");
+    ref = collection(db, "Hive", hid, "HoneyComb", cid, "messages", String(parentMessageID), "Threads");
   } else {
-    ref = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
+    ref = collection(db, "Hive", hid, "Honeycomb", cid, "messages");
   }
 
   const q = query(ref, where("timestamp", ">", new Date(lastSeenMs)));
@@ -217,40 +309,27 @@ export async function getUnreadCount(hiveID, honeycombID, uid, parentMessageID =
   return snap.size;
 }
 
-/**
- * Check if Honeycomb has unread messages (returns count)
- */
-export async function checkHoneycombUnread(hiveID, honeycombID, uid) {
-  const count = await getUnreadCount(hiveID, honeycombID, uid);
-  return count > 0 ? count : 0;
-}
-
-/**
- * Get unread count for a thread
- */
 export async function getThreadUnreadCount(hiveID, honeycombID, messageID, uid) {
   if (!hiveID || !honeycombID || !messageID || !uid) return 0;
-  return await getUnreadCount(hiveID, honeycombID, uid, messageID);
+  return await getUnreadCount(hiveID, honeycombID, uid, String(messageID));
 }
 
-/**
- * Get unread count for a honeycomb
- */
 export async function getHoneycombUnreadCount(hiveID, honeycombID, uid) {
   return await getUnreadCount(hiveID, honeycombID, uid);
 }
 
-/**
- * Get all unread counts for honeycombs in a hive
- */
 export async function getAllUnreadCounts(hiveID, uid) {
-  if (!uid) return {};
-  const honeycombRef = collection(db, "Hive", hiveID, "Honeycomb");
+  if (!uid || !hiveID) return {};
+
+  const hid = String(hiveID);
+  const userId = String(uid);
+
+  const honeycombRef = collection(db, "Hive", hid, "Honeycomb");
   const honeycombSnapshot = await getDocs(honeycombRef);
 
   const countsPromises = honeycombSnapshot.docs.map(async (docSnap) => {
     const honeycombID = docSnap.id;
-    const count = await getHoneycombUnreadCount(hiveID, honeycombID, uid);
+    const count = await getHoneycombUnreadCount(hid, honeycombID, userId);
     return [honeycombID, count];
   });
 
@@ -260,60 +339,122 @@ export async function getAllUnreadCounts(hiveID, uid) {
 
 export async function setThreadStatus(hiveID, honeycombID, parentMessageID, threadID, status) {
   if (!["open", "closed"].includes(status)) throw new Error("Invalid status");
-  const threadRef = doc(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages", parentMessageID, "Threads", threadID);
+
+  const hid = asId(hiveID, "hiveID");
+  const cid = asId(honeycombID, "honeycombID");
+  const pid = asId(parentMessageID, "parentMessageID");
+  const tid = asId(threadID, "threadID");
+
+  const threadRef = doc(db, "Hive", hid, "Honeycomb", cid, "messages", pid, "Threads", tid);
   await setDoc(threadRef, { status }, { merge: true });
 }
 
 /* ----------------- THREAD CLOSING + NOTIFICATIONS ----------------- */
 
-/**
- * Close a thread and notify all participants immediately
- */
-export async function closeThreadAndNotify(
-  hiveID,
-  honeycombID,
-  parentMessageID,
-  threadID,
-  closedByUser
-) {
+export async function closeThreadAndNotify(hiveID, honeycombID, parentMessageID, threadID, closedByUser) {
   try {
-    // 1️⃣ Update thread status to "closed"
-    await updateThreadStatus(hiveID, honeycombID, parentMessageID, threadID, "closed");
+    const hid = asId(hiveID, "hiveID");
+    const cid = asId(honeycombID, "honeycombID");
+    const pid = asId(parentMessageID, "parentMessageID");
+    const tid = asId(threadID, "threadID");
 
-    // 2️⃣ Get participants
-    const participants = await getThreadParticipants(hiveID, honeycombID, parentMessageID, threadID);
+    await updateThreadStatus(hid, cid, pid, tid, "closed");
 
-    if (!participants || participants.length === 0) {
-      console.warn("⚠️ No participants found for thread:", threadID);
-      return;
-    }
+    const participants = await getThreadParticipants(hid, cid, pid, tid);
 
-    // 3️⃣ Extract UIDs only (avoid object vs string issues)
-    const userIDs = participants
+    const userIDs = (participants || [])
       .map((p) => (typeof p === "string" ? p : p?.uid))
-      .filter(Boolean);
+      .filter(Boolean)
+      .map(String);
 
-    if (userIDs.length === 0) {
-      console.warn("⚠️ No valid user IDs to notify for thread:", threadID);
-      return;
-    }
+    if (userIDs.length === 0) return;
 
-    // 4️⃣ Build notification message
-    const message = `Thread "${threadID}" was closed by ${closedByUser?.displayName || "a user"}.`;
+    const message = `Thread "${tid}" was closed by ${closedByUser?.displayName || "a user"}.`;
 
-    // 5️⃣ Notify all participants immediately
     await notifyUsers(userIDs, {
       type: "THREAD_CLOSED",
-      hiveID,
-      honeycombID,
-      threadID,
+      hiveID: hid,
+      honeycombID: cid,
+      threadID: tid,
       message,
-      notifyAt: null, // Not time-based; show immediately
+      notifyAt: null,
     });
-
-    console.log(`✅ THREAD_CLOSED notifications sent to:`, userIDs);
-
   } catch (error) {
     console.error("❌ Failed to close thread and notify participants:", error);
+  }
+}
+
+// ---- Dashboard / Personal Assistant thread (global) ----
+const ASSISTANT_THREAD_ID = "default";
+
+const assistantMessagesRef = (uid) =>
+  collection(db, "Users", String(uid), "assistantThreads", ASSISTANT_THREAD_ID, "messages");
+
+export function useSendAssistantMessage() {
+  const { user } = useUser();
+
+  const sendAssistantMessage = async (text, attachment = null) => {
+    if (!user) throw new Error("User not authenticated");
+
+    const ref = assistantMessagesRef(user.uid);
+
+    const normalized = normalizeAttachment(attachment);
+
+    const docRef = await addDoc(ref, {
+      type: normalized ? "file" : "text",
+      text: text || "",
+      attachment: normalized,
+      sender: user.displayName || user.email || "User",
+      senderId: user.uid,
+      timestamp: serverTimestamp(),
+    });
+
+    return docRef.id;
+  };
+
+  return sendAssistantMessage;
+}
+
+export function subscribeToAssistantMessages(callback, uid) {
+  if (!uid) {
+    console.warn("subscribeToAssistantMessages missing uid");
+    return () => {};
+  }
+
+  const ref = assistantMessagesRef(uid);
+  const q = query(ref, orderBy("timestamp", "asc"));
+
+  return onSnapshot(q, (snapshot) => {
+    const msgs = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+    callback(msgs);
+  });
+}
+
+export async function sendAssistantAIReply(promptText, uid) {
+  if (!uid) throw new Error("uid is required");
+
+  const ref = assistantMessagesRef(uid);
+
+  try {
+    const aiResponse = await callGeminiAPI(promptText);
+
+    await addDoc(ref, {
+      type: "text",
+      text: aiResponse,
+      attachment: null,
+      sender: "AI Bot",
+      senderId: "AI",
+      timestamp: serverTimestamp(),
+    });
+  } catch (e) {
+    console.error("sendAssistantAIReply failed:", e);
+    await addDoc(ref, {
+      type: "text",
+      text: "AI could not generate a response.",
+      attachment: null,
+      sender: "AI Bot",
+      senderId: "AI",
+      timestamp: serverTimestamp(),
+    });
   }
 }
