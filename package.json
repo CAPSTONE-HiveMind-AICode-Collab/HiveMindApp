@@ -13,6 +13,7 @@
     "@google/generative-ai": "^0.24.1",
     "@tensorflow-models/toxicity": "^1.2.2",
     "@tensorflow/tfjs": "^4.22.0",
+    "encoding": "^0.1.13",
     "firebase": "^12.4.0",
     "jszip": "^3.10.1",
     "mammoth": "^1.11.0",
@@ -25,6 +26,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "eslint": "^9.39.1",
     "tailwindcss": "^4"
   }
 }
