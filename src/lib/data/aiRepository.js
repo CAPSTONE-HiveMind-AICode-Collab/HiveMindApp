@@ -33,7 +33,7 @@ export async function callGeminiAPI(userText, model) {
  * Triggers a RAG (Retrieval-Augmented Generation) flow.
  * It pulls the 'Nectar' from Firestore and feeds it as context to Gemini.
  */
-export async function askHiveMemory(hiveID, userQuestion, model = "gemini-2.0-flash") {
+export async function askHiveMemory(hiveID, userQuestion, model = "gemini-2.5-flash") {
   try {
     // 1. Fetch the Knowledge Nectar (Project Memory)
     // Note: Make sure 'Hive' matches the case in your Firestore exactly
