@@ -36,7 +36,7 @@ export async function callGeminiAPI(userText, model) {
 export async function askHiveMemory(hiveID, userQuestion, model = "gemini-2.5-flash") {
   try {
     // 1. Fetch the Knowledge Nectar (Project Memory)
-    // Note: Make sure 'Hive' matches the case in your Firestore exactly
+    // Note: Make sure that the 'Hive' matches the case in your Firestore exactly
     const nectarRef = collection(db, "Hive", hiveID, "knowledgeNectar");
     const snapshot = await getDocs(nectarRef);
     
