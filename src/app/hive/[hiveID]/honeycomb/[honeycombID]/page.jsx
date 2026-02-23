@@ -18,6 +18,7 @@ import {
 
 import { useUser } from "@/lib/auth/userContext";
 import { callGeminiAPI } from "@/lib/data/aiRepository";
+import { buildAskAIContext } from "@/lib/business/contextBuilderService";
 import { db } from "@/lib/firebase/config";
 import {
   collection,
@@ -29,6 +30,7 @@ import {
 } from "firebase/firestore";
 
 import { checkPermission } from "@/lib/business/permissionService";
+import { filterSensitiveData } from "@/lib/business/privacyPolicyChecker";
 import { listThreadSummaries } from "@/lib/data/summaryRepository";
 
 import CodeBlock from "@/components/CodeBlock";
@@ -37,6 +39,7 @@ import AttachmentList from "@/components/attachmentList";
 
 import CreateTaskModal from "@/components/CreateTaskModal";
 import { createTaskFromMessage } from "@/lib/data/taskRepository";
+
 
 export default function HoneycombChatPage() {
   const params = useParams();
@@ -47,6 +50,8 @@ export default function HoneycombChatPage() {
   const { user, loading } = useUser();
 
   const [message, setMessage] = useState("");
+  // queued attachments (upload now, send later)
+  const [pendingAttachments, setPendingAttachments] = useState([]);
 
   const [selectedModel, setSelectedModel] = useState(
     process.env.NEXT_PUBLIC_DEFAULT_MODEL ||
@@ -55,6 +60,7 @@ export default function HoneycombChatPage() {
         : "gemini-2.5-flash")
   );
 
+  const [aiScope, setAiScope] = useState("message");
   const [messages, setMessages] = useState([]);
   const [threads, setThreads] = useState({});
   const [loadingAI, setLoadingAI] = useState(false);
@@ -108,7 +114,6 @@ export default function HoneycombChatPage() {
       "border-cyan-500 bg-cyan-50",
     ];
 
-
     const randomColor = colors[Math.floor(Math.random() * colors.length)];
     setUserColors((prev) => ({ ...prev, [userId]: randomColor }));
     return randomColor;
@@ -116,15 +121,14 @@ export default function HoneycombChatPage() {
 
   const normalizeAttachments = (msg) => {
     const raw =
-    msg?.attachment ??
-    msg?.attachments ??
-    msg?.files ??
-    msg?.file ??
-    msg?.meta ??
-    null;
+      msg?.attachment ??
+      msg?.attachments ??
+      msg?.files ??
+      msg?.file ??
+      msg?.meta ??
+      null;
 
     if (!raw) return [];
-
     const arr = Array.isArray(raw) ? raw : [raw];
 
     return arr
@@ -140,10 +144,9 @@ export default function HoneycombChatPage() {
         url: a.url ?? a.downloadURL ?? a.downloadUrl ?? a.storageUrl ?? "",
         contentType: a.contentType ?? a.type ?? a.mimeType ?? "unknown",
         size: a.size ?? a.bytes ?? a.fileSize ?? 0,
-      text: a.text ?? "",
-    }));
-};
-
+        text: a.text ?? "",
+      }));
+  };
 
   const getRoleEmoji = (role) => {
     const roleMap = {
@@ -417,7 +420,7 @@ export default function HoneycombChatPage() {
     }
   };
 
-  /* ----------------- AUTO-SCROLL (when not searching/loading older) ----------------- */
+  /* ----------------- AUTO-SCROLL ----------------- */
   useEffect(() => {
     if (searchQuery) return;
     if (loadingOlderMessages) return;
@@ -428,19 +431,42 @@ export default function HoneycombChatPage() {
     }
   }, [messages, searchQuery, loadingOlderMessages]);
 
-  /* ----------------- SEND MESSAGE ----------------- */
+
+  /* ----------------- FILE UPLOAD (QUEUE ONLY) ----------------- */
+  const handleFileUploaded = async (meta) => {
+    if (!canChat) {
+      alert("You have view-only access in this hive and cannot upload files.");
+      return;
+    }
+
+    const arr = Array.isArray(meta) ? meta : meta ? [meta] : [];
+    if (arr.length === 0) return;
+
+    // queue it; don't send message yet
+    setPendingAttachments((prev) => [...prev, ...arr]);
+  };
+
+  /* ----------------- SEND MESSAGE (TEXT + QUEUED FILES) ----------------- */
   const handleSendMessage = async (e) => {
     e.preventDefault();
-    if (!message.trim()) return;
 
     if (!canChat) {
       alert("You have view-only access in this hive and cannot send messages.");
       return;
     }
 
+    const text = message.trim();
+    const hasAttachments = pendingAttachments.length > 0;
+
+    //  allow attachments-only
+    if (!text && !hasAttachments) return;
+
     try {
-      await sendUserMessage(message, hiveID, honeycombID);
+      await sendUserMessage(text, hiveID, honeycombID, [], pendingAttachments);
+
+      // reset composer
       setMessage("");
+      setPendingAttachments([]);
 
       const unreadCount = await getHoneycombUnreadCount(
         hiveID,
@@ -450,27 +476,6 @@ export default function HoneycombChatPage() {
       setUnreadMessageCount(unreadCount);
     } catch (err) {
       console.error("Send message failed:", err);
-    }
-  };
-
-  /* ----------------- SEND FILE MESSAGE (UPLOAD) ----------------- */
-  const handleFileUploaded = async (meta) => {
-    if (!canChat) {
-      alert("You have view-only access in this hive and cannot upload files.");
-      return;
-    }
-
-    try {
-      const label = meta?.name ? `📎 Uploaded: ${meta.name}` : "📎 Uploaded a file";
-      await sendUserMessage(label, hiveID, honeycombID, [], meta);
-      const unreadCount = await getHoneycombUnreadCount(
-        hiveID,
-        honeycombID,
-        user.uid
-      );
-      setUnreadMessageCount(unreadCount);
-    } catch (err) {
-      console.error("Send file message failed:", err);
     }
   };
 
@@ -499,8 +504,9 @@ export default function HoneycombChatPage() {
     }
   };
 
-  /* ----------------- AI REPLY (attachments + model picker + perms) ----------------- */
-  const handleAIReply = async (msgOrText) => {
+  /* ----------------- AI REPLY (context + attachments) ----------------- */
+    /* ----------------- AI REPLY (scoped context + attachments + privacy) ----------------- */
+  const handleAIReply = async (msgOrText, scope = "message") => {
     const msg =
       typeof msgOrText === "object" && msgOrText !== null
         ? msgOrText
@@ -514,19 +520,41 @@ export default function HoneycombChatPage() {
     try {
       setLoadingAI(true);
 
-      const attachments = normalizeAttachments(msg);
-        
+      // 1) Collect attachments from THIS message only
+      const attachments = msg?.attachment
+        ? Array.isArray(msg.attachment)
+          ? msg.attachment
+          : [msg.attachment]
+        : [];
+
+      // 2) Build text/description blocks from attachments
       const MAX_ATTACHMENT_CHARS_TO_AI = 8000;
 
       const attachmentTextBlock = attachments
-        .filter((a) => a?.text)
+        .filter((a) => a?.text || a?.imageDescription)
         .map((a) => {
-          const sliced = a.text.slice(0, MAX_ATTACHMENT_CHARS_TO_AI);
-          const truncated =
-            a.text.length > MAX_ATTACHMENT_CHARS_TO_AI ? "\n\n[TRUNCATED]" : "";
-          return `\n\nAttached text content (${a.name || "file.txt"}):\n${sliced}${truncated}`;
+          const hasText = !!a.text;
+          const hasDesc = !!a.imageDescription;
+          const parts = [];
+
+          if (hasText) {
+            const sliced = a.text.slice(0, MAX_ATTACHMENT_CHARS_TO_AI);
+            const truncated =
+              a.text.length > MAX_ATTACHMENT_CHARS_TO_AI ? "\n\n[TRUNCATED]" : "";
+            parts.push(
+              `Attached text content (${a.name || "file.txt"}):\n${sliced}${truncated}`
+            );
+          }
+
+          if (hasDesc) {
+            parts.push(
+              `Image description (${a.name || "image"}): ${a.imageDescription}`
+            );
+          }
+
+          return parts.join("\n\n");
         })
-        .join("\n");
+        .join("\n\n");
 
       const attachmentMetaBlock =
         attachments.length > 0
@@ -540,21 +568,37 @@ export default function HoneycombChatPage() {
               .join("\n")}`
           : "";
 
+      // 3) Base text from the clicked message
       const baseText = String(msg?.text || "").trim();
-      let prompt = `${baseText}${attachmentTextBlock}${attachmentMetaBlock}`.trim();
 
-      if (!prompt && attachments.length > 0) {
-        prompt =
+      let promptBody = `${baseText}${attachmentTextBlock}${attachmentMetaBlock}`.trim();
+
+      // If no plain text but we *do* have files, give the AI some instructions
+      if (!promptBody && attachments.length > 0) {
+        promptBody =
           `A user uploaded file(s) to a chat message, but plain text content was not extracted.\n` +
           `${attachmentMetaBlock}\n\nReply with:\n` +
           `1) A short acknowledgement\n2) What you can and cannot do without parsing the file contents\n` +
-          `3) Next best step\n4) Suggestions`;
+          `3) Next best step\n4) Suggestions.`;
       }
 
-      if (!prompt) return;
+      // If still nothing to say, bail
+      if (!promptBody) return;
 
-      const aiText = await callGeminiAPI(prompt, selectedModel);
+      // 4) Use the new contextBuilderService to:
+      //    - pick history based on scope
+      //    - apply privacy filters to prompt + history
+      const { prompt, history } = buildAskAIContext({
+        scope,
+        messages,
+        targetMessage: msg,
+        promptBody,
+      });
 
+      // 5) Call Gemini with the safe prompt + scoped history
+      const aiText = await callGeminiAPI(prompt, selectedModel, history);
+
+      // 6) Save AI reply as a normal chat message
       const messagesRef = collection(
         db,
         "Hive",
@@ -585,7 +629,14 @@ export default function HoneycombChatPage() {
     setTaskModalOpen(true);
   };
 
-  const saveTask = async ({ title, description, checklist, status, priority, dueAt }) => {
+  const saveTask = async ({
+    title,
+    description,
+    checklist,
+    status,
+    priority,
+    dueAt,
+  }) => {
     const msg = taskSourceMsg;
     if (!msg) return;
 
@@ -619,12 +670,11 @@ export default function HoneycombChatPage() {
     }
   };
 
-  /* ----------------- OPEN THREAD (merge: highlight + unread reset) ----------------- */
+  /* ----------------- OPEN THREAD ----------------- */
   const handleOpenThread = useCallback(
     async (messageID) => {
       setActiveThreadMessageID(messageID);
 
-      // Scroll/highlight the parent message in main feed
       try {
         const el = document.getElementById(`message-${messageID}`);
         if (el) {
@@ -639,7 +689,6 @@ export default function HoneycombChatPage() {
         console.error("Scroll/highlight failed:", err);
       }
 
-      // Mark thread as read + refresh header count
       try {
         await updateLastSeen(hiveID, honeycombID, messageID, user.uid);
         setUnreadThreads((prev) => ({ ...prev, [messageID]: 0 }));
@@ -657,7 +706,7 @@ export default function HoneycombChatPage() {
     [hiveID, honeycombID, user]
   );
 
-  /* ----------------- HELPER: RENDER MESSAGE TEXT (CodeBlock + lists + styling) ----------------- */
+  /* ----------------- RENDER MESSAGE TEXT ----------------- */
   const renderMessageText = (text, senderId = null) => {
     if (!text) return null;
     const isAI = senderId === "AI";
@@ -688,11 +737,7 @@ export default function HoneycombChatPage() {
     return nodes.map((node, idx) => {
       if (node.type === "code") {
         return (
-          <CodeBlock
-            key={`code-${idx}`}
-            code={node.content}
-            language={node.lang}
-          />
+          <CodeBlock key={`code-${idx}`} code={node.content} language={node.lang} />
         );
       }
 
@@ -733,7 +778,7 @@ export default function HoneycombChatPage() {
     });
   };
 
-  /* ----------------- FILTERED MESSAGES (search) ----------------- */
+  /* ----------------- FILTERED MESSAGES ----------------- */
   const filteredMessages = messages.filter((m) => {
     if (!searchQuery.trim()) return true;
     const q = searchQuery.toLowerCase();
@@ -754,6 +799,10 @@ export default function HoneycombChatPage() {
     const arr = a ? (Array.isArray(a) ? a : [a]) : [];
     return arr.find((x) => x?.text)?.text || "";
   })();
+
+  // ✅ HERE is sendDisabled (right before return)
+  const sendDisabled =
+    !canChat || (!message.trim() && pendingAttachments.length === 0);
 
   return (
     <div className="flex h-screen bg-yellow-50">
@@ -812,18 +861,8 @@ export default function HoneycombChatPage() {
                 className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
                 type="button"
               >
-                <svg
-                  className="w-5 h-5"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M6 18L18 6M6 6l12 12"
-                  />
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                 </svg>
               </button>
             )}
@@ -854,18 +893,8 @@ export default function HoneycombChatPage() {
                   </>
                 ) : (
                   <>
-                    <svg
-                      className="w-4 h-4"
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M5 15l7-7 7 7"
-                      />
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
                     </svg>
                     <span>Load Older Messages</span>
                   </>
@@ -876,18 +905,8 @@ export default function HoneycombChatPage() {
 
           {filteredMessages.length === 0 && searchQuery ? (
             <div className="flex flex-col items-center justify-center h-64 text-gray-500">
-              <svg
-                className="w-16 h-16 mb-4"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
-                />
+              <svg className="w-16 h-16 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
               </svg>
               <p className="text-lg font-semibold">No messages found</p>
               <p className="text-sm">Try a different search term</p>
@@ -914,9 +933,7 @@ export default function HoneycombChatPage() {
                 {threadUnread > 0 && (
                   <span
                     className="absolute -top-2 -right-2 px-2 py-0.5 bg-blue-600 text-white text-xs rounded-full shadow"
-                    title={`${threadUnread} unread thread message${
-                      threadUnread > 1 ? "s" : ""
-                    }`}
+                    title={`${threadUnread} unread thread message${threadUnread > 1 ? "s" : ""}`}
                   >
                     {threadUnread}
                   </span>
@@ -935,35 +952,16 @@ export default function HoneycombChatPage() {
                 </div>
 
                 <div>{renderMessageText(m.text, m.senderId)}</div>
-                {/* ✅ Show uploaded files in chat */}
-{attachments.length > 0 && (
-  <div className="mt-2">
-    <div className="text-xs font-semibold text-gray-700 mb-1">
-      📎 {attachments.length} attachment{attachments.length !== 1 ? "s" : ""}
-    </div>
 
-    {/* Use your component if it exists */}
-    <AttachmentList attachments={attachments} />
-
-    {/* Fallback (in case AttachmentList doesn’t render for some formats) */}
-    <div className="mt-2 space-y-2">
-      {attachments.map((a, idx) => (
-        <a
-          key={idx}
-          href={a.url || "#"}
-          target="_blank"
-          rel="noreferrer"
-          className="block text-sm underline text-blue-700 hover:text-blue-900 break-all"
-        >
-          {a.url ? `📄 ${a.name} (${Math.round((a.size || 0) / 1024)} KB)` : `📄 ${a.name}`}
-        </a>
-      ))}
-    </div>
-  </div>
-)}
-
-                {/* Attachments */}
-              
+                {/*  Attachments displayed ONCE */}
+                {attachments.length > 0 && (
+                  <div className="mt-2">
+                    <div className="text-xs font-semibold text-gray-700 mb-1">
+                      📎 {attachments.length} attachment{attachments.length !== 1 ? "s" : ""}
+                    </div>
+                    <AttachmentList attachments={attachments} />
+                  </div>
+                )}
 
                 {Array.isArray(m.linkedTaskIds) && m.linkedTaskIds.length > 0 && (
                   <div className="mt-1 text-xs text-green-700 font-semibold">
@@ -972,8 +970,9 @@ export default function HoneycombChatPage() {
                 )}
 
                 <div className="flex flex-col sm:flex-row sm:space-x-3 space-y-2 sm:space-y-0 mt-2">
-                  {m.senderId === user.uid && (
+                    {m.senderId === user.uid && (
                     <div className="flex items-center gap-2 flex-wrap">
+                      {/* Model picker */}
                       <select
                         value={selectedModel}
                         onChange={(e) => setSelectedModel(e.target.value)}
@@ -982,15 +981,28 @@ export default function HoneycombChatPage() {
                         aria-label="Choose AI model"
                       >
                         <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                        <option value="gemini-2.5-flash-lite">
-                          gemini-2.5-flash-lite
-                        </option>
+                        <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
                         <option value="gemini-2.5-pro">gemini-2.5-pro</option>
                       </select>
 
+                      {/* NEW: scope picker */}
+                      <select
+                        value={aiScope}
+                        onChange={(e) => setAiScope(e.target.value)}
+                        className="text-xs sm:text-sm p-1 border border-gray-300 rounded bg-white text-gray-800 min-w-[9rem]"
+                        title="How much chat context to send to AI"
+                        aria-label="Ask AI context scope"
+                      >
+                        <option value="message">This message only</option>
+                        <option value="last_5">Last 5 messages</option>
+                        <option value="last_20">Last 20 messages</option>
+                        <option value="entire_chat">Entire chat</option>
+                      </select>
+
+                      {/* Ask AI uses the selected scope */}
                       <button
                         className="text-xs sm:text-sm bg-blue-600 text-white px-3 py-1.5 sm:py-1 rounded hover:bg-blue-700 shadow disabled:opacity-50"
-                        onClick={() => handleAIReply(m)} // keep attachments!
+                        onClick={() => handleAIReply(m, aiScope)}
                         disabled={loadingAI || !canChat}
                         aria-disabled={loadingAI || !canChat}
                         type="button"
@@ -1037,68 +1049,119 @@ export default function HoneycombChatPage() {
         {/* Composer */}
         <form
           onSubmit={handleSendMessage}
-          className="p-2 sm:p-4 flex gap-2 bg-white border-t border-gray-300"
+          className="p-2 sm:p-4 flex flex-col gap-2 bg-white border-t border-gray-300"
         >
-          <div className="flex-1 relative">
-            <input
-              className="w-full border border-gray-400 rounded-lg p-2 pr-12 text-sm sm:text-base text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400"
-              placeholder={canChat ? "Type or use voice..." : "View-only access"}
-              value={message}
-              onChange={(e) => setMessage(e.target.value)}
-              disabled={!canChat}
-            />
+          {/* ✅ Pending attachment queue UI */}
+          {pendingAttachments.length > 0 && (
+            <div className="w-full p-2 rounded-lg border border-blue-200 bg-blue-50">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs font-semibold text-blue-800">
+                  📎 Ready to send ({pendingAttachments.length})
+                </p>
 
-            {speechSupported && canChat && (
-              <button
-                type="button"
-                onClick={toggleVoiceRecording}
-                className={`absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg transition-all duration-200 ${
-                  isRecording
-                    ? "bg-red-500 text-white animate-pulse"
-                    : "bg-blue-100 text-blue-600 hover:bg-blue-200"
-                }`}
-                title={isRecording ? "Stop recording" : "Start voice input"}
-              >
-                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                  <path
-                    fillRule="evenodd"
-                    d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z"
-                    clipRule="evenodd"
-                  />
-                </svg>
-              </button>
-            )}
-          </div>
+                <button
+                  type="button"
+                  className="text-xs text-blue-700 underline hover:text-blue-900"
+                  onClick={() => setPendingAttachments([])}
+                >
+                  Clear
+                </button>
+              </div>
 
-          {canChat && (
-            <FileUploader
-              hiveID={hiveID}
-              honeycombID={honeycombID}
-              userId={user.uid}
-              onUploaded={handleFileUploaded}
-            />
+              <div className="flex flex-wrap gap-2">
+                {pendingAttachments.map((a, idx) => (
+                  <div
+                    key={`${a?.url || a?.name || "file"}-${idx}`}
+                    className="flex items-center gap-2 px-2 py-1 rounded bg-white border border-blue-200"
+                  >
+                    <span className="text-xs text-gray-800 break-all max-w-[240px]">
+                      {a?.name || "file"}
+                    </span>
+
+                    <button
+                      type="button"
+                      className="text-xs text-red-600 hover:text-red-800"
+                      onClick={() =>
+                        setPendingAttachments((prev) =>
+                          prev.filter((_, i) => i !== idx)
+                        )
+                      }
+                      title="Remove"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              <p className="text-[11px] text-blue-700 mt-2">
+                Uploads are queued. Click <b>Send</b> to post them to the chat.
+              </p>
+            </div>
           )}
 
-          <button
-            type="submit"
-            disabled={!canChat}
-            className="bg-yellow-400 px-3 sm:px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700 flex items-center gap-2 disabled:opacity-50"
-          >
-            <span className="hidden sm:inline">Send</span>
-            <svg
-              className="w-5 h-5 sm:hidden"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
+          <div className="flex gap-2">
+            <div className="flex-1 relative">
+              <input
+                className="w-full border border-gray-400 rounded-lg p-2 pr-12 text-sm sm:text-base text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400"
+                placeholder={canChat ? "Type or use voice..." : "View-only access"}
+                value={message}
+                onChange={(e) => setMessage(e.target.value)}
+                disabled={!canChat}
               />
-            </svg>
-          </button>
+
+              {speechSupported && canChat && (
+                <button
+                  type="button"
+                  onClick={toggleVoiceRecording}
+                  className={`absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg transition-all duration-200 ${
+                    isRecording
+                      ? "bg-red-500 text-white animate-pulse"
+                      : "bg-blue-100 text-blue-600 hover:bg-blue-200"
+                  }`}
+                  title={isRecording ? "Stop recording" : "Start voice input"}
+                >
+                  <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                    <path
+                      fillRule="evenodd"
+                      d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                </button>
+              )}
+            </div>
+
+            {canChat && (
+              <FileUploader
+                hiveID={hiveID}
+                honeycombID={honeycombID}
+                userId={user.uid}
+                onUploaded={handleFileUploaded}
+              />
+            )}
+
+            <button
+              type="submit"
+              disabled={sendDisabled}
+              className="bg-yellow-400 px-3 sm:px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700 flex items-center gap-2 disabled:opacity-50"
+            >
+              <span className="hidden sm:inline">Send</span>
+              <svg
+                className="w-5 h-5 sm:hidden"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
+                />
+              </svg>
+            </button>
+          </div>
         </form>
       </div>
 
@@ -1158,7 +1221,6 @@ function ThreadPanel({
 
   const replyInputRef = useRef(null);
 
-  // Resizable panel state
   const [panelWidth, setPanelWidth] = useState(384);
   const [isResizing, setIsResizing] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
@@ -1216,7 +1278,6 @@ function ThreadPanel({
     loadMemberRoles();
   }, [hiveID]);
 
-  // Mobile detect
   useEffect(() => {
     const checkMobile = () => setIsMobile(window.innerWidth < 768);
     checkMobile();
@@ -1224,7 +1285,6 @@ function ThreadPanel({
     return () => window.removeEventListener("resize", checkMobile);
   }, []);
 
-  // Resize handlers
   const handleMouseDown = (e) => {
     e.preventDefault();
     setIsResizing(true);
@@ -1254,7 +1314,6 @@ function ThreadPanel({
     };
   }, [isResizing]);
 
-  // Focus reply input on open
   useEffect(() => {
     if (!activeThreadMessageID) return;
     try {
@@ -1266,7 +1325,6 @@ function ThreadPanel({
     }
   }, [activeThreadMessageID]);
 
-  // UI Guide persistent dismissal
   const [showHelp, setShowHelp] = useState(true);
   useEffect(() => {
     try {
@@ -1408,31 +1466,33 @@ function ThreadPanel({
         </button>
       )}
 
-      {/* Summary only for this thread if closed */}
-      {threadClosed &&
-        (() => {
-          const threadSummary = (summaries || []).find(
-            (s) => s.threadID === currentThread[0]?.id
-          );
-          return threadSummary ? (
-            <div className="mt-4 bg-gradient-to-br from-indigo-50 via-blue-50 to-cyan-50 border-2 border-indigo-200 rounded-2xl shadow-lg overflow-hidden">
-              <div className="bg-gradient-to-r from-indigo-600 to-blue-600 px-4 py-3 flex items-center gap-2">
-                <span className="text-2xl">✨</span>
-                <h2 className="text-base font-bold text-white">Thread Summary</h2>
-              </div>
+  
+        {threadClosed &&
+          (() => {
+            const threadSummary = (summaries || []).find(
+              (s) => s.threadID === currentThread[0]?.id
+            );
 
-              <div className="p-4">
-                <SummaryCard
-                  summary={threadSummary}
-                  onOpenThread={onOpenThread}
-                  threadMessages={currentThread}
-                  parentMessage={parentMessage}
-                  showOpenButton={false}
-                />
+            return threadSummary ? (
+              <div className="mt-4 bg-gradient-to-br from-indigo-50 via-blue-50 to-cyan-50 border-2 border-indigo-200 rounded-2xl shadow-lg overflow-hidden">
+                <div className="bg-gradient-to-r from-indigo-600 to-blue-600 px-4 py-3 flex items-center gap-2">
+                  <span className="text-2xl">✨</span>
+                  <h2 className="text-base font-bold text-white">Thread Summary</h2>
+                </div>
+
+                <div className="p-4">
+                  <SummaryCard
+                    summary={threadSummary}
+                    onOpenThread={onOpenThread}
+                    threadMessages={currentThread}
+                    parentMessage={parentMessage}
+                    showOpenButton={false}
+                  />
+                </div>
               </div>
-            </div>
-          ) : null;
-        })()}
+            ) : null;
+          })()}
+
 
       {showHelp && (
         <div className="mt-4 p-3 bg-white border border-gray-200 rounded-lg shadow-sm">
@@ -1461,11 +1521,7 @@ function ThreadPanel({
             </li>
             <li>
               <strong>Ask AI:</strong> Use on a message you sent to generate an
-              AI reply into the conversation (supports attachments metadata).
-            </li>
-            <li>
-              <strong>Completed subtasks:</strong> When a thread is closed an AI
-              summary may appear below.
+              AI reply into the conversation.
             </li>
           </ul>
         </div>
@@ -1476,167 +1532,173 @@ function ThreadPanel({
 
 /* ----------------- SUMMARY CARD ----------------- */
 function SummaryCard({
-  summary,
-  index,
-  onOpenThread,
-  threadMessages,
-  showOpenButton = true,
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
+        summary,
+        index,
+        onOpenThread,
+        threadMessages,
+        showOpenButton = true,
+      }) {
+        const [expanded, setExpanded] = useState(false);
+        const [copied, setCopied] = useState(false);
 
-  const [userColor] = useState(() => {
-    const colors = [
-      "from-yellow-500 to-yellow-600",
-      "from-blue-500 to-blue-600",
-      "from-green-500 to-green-600",
-      "from-purple-500 to-purple-600",
-      "from-pink-500 to-pink-600",
-      "from-indigo-500 to-indigo-600",
-      "from-orange-500 to-orange-600",
-      "from-teal-500 to-teal-600",
-      "from-red-500 to-red-600",
-      "from-cyan-500 to-cyan-600",
-    ];
-    return colors[Math.floor(Math.random() * colors.length)];
-  });
+        const [userColor] = useState(() => {
+          const colors = [
+            "from-yellow-500 to-yellow-600",
+            "from-blue-500 to-blue-600",
+            "from-green-500 to-green-600",
+            "from-purple-500 to-purple-600",
+            "from-pink-500 to-pink-600",
+            "from-indigo-500 to-indigo-600",
+            "from-orange-500 to-orange-600",
+            "from-teal-500 to-teal-600",
+            "from-red-500 to-red-600",
+            "from-cyan-500 to-cyan-600",
+          ];
+          return colors[Math.floor(Math.random() * colors.length)];
+        });
 
-  const getRoleEmoji = (role) => {
-    const roleMap = {
-      OWNER: "👑",
-      ADMIN: "⚡",
-      MEMBER: "👤",
-      VIEWER: "👁️",
-    };
-    return roleMap[role] || "👤";
-  };
+        const getRoleEmoji = (role) => {
+          const roleMap = {
+            OWNER: "👑",
+            ADMIN: "⚡",
+            MEMBER: "👤",
+            VIEWER: "👁️",
+          };
+          return roleMap[role] || "👤";
+        };
 
-  const getRelativeTime = (timestamp) => {
-    if (!timestamp) return "Unknown time";
-    const date = timestamp?.toDate ? timestamp.toDate() : new Date(timestamp);
-    const now = new Date();
-    const diff = now - date;
-    const minutes = Math.floor(diff / 60000);
-    const hours = Math.floor(diff / 3600000);
-    const days = Math.floor(diff / 86400000);
+        const getRelativeTime = (timestamp) => {
+          if (!timestamp) return "Unknown time";
+          const date = timestamp?.toDate ? timestamp.toDate() : new Date(timestamp);
+          const now = new Date();
+          const diff = now - date;
 
-    if (minutes < 1) return "Just now";
-    if (minutes < 60) return `${minutes}m ago`;
-    if (hours < 24) return `${hours}h ago`;
-    if (days < 7) return `${days}d ago`;
-    return date.toLocaleDateString();
-  };
+          const minutes = Math.floor(diff / 60000);
+          const hours = Math.floor(diff / 3600000);
+          const days = Math.floor(diff / 86400000);
 
-  const handleCopy = async (e) => {
-    e.stopPropagation();
-    try {
-      await navigator.clipboard.writeText(summary.summaryText || "");
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error("Failed to copy:", err);
-    }
-  };
+          if (minutes < 1) return "Just now";
+          if (minutes < 60) return `${minutes}m ago`;
+          if (hours < 24) return `${hours}h ago`;
+          if (days < 7) return `${days}d ago`;
+          return date.toLocaleDateString();
+        };
 
-  const messageCount = threadMessages?.length || 0;
+        const handleCopy = async (e) => {
+          e.stopPropagation();
+          try {
+            await navigator.clipboard.writeText(summary.summaryText || "");
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+          } catch (err) {
+            console.error("Failed to copy:", err);
+          }
+        };
 
-  return (
-    <div className="bg-white rounded-xl border-2 border-indigo-100 shadow-sm hover:shadow-md transition-all duration-200">
-      <div className="p-3 cursor-pointer" onClick={() => setExpanded(!expanded)}>
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-start gap-2 flex-1">
-            {index !== undefined && (
-              <div
-                className={`flex-shrink-0 w-6 h-6 rounded-full bg-gradient-to-br ${userColor} flex items-center justify-center text-white text-xs font-bold`}
-              >
-                {index + 1}
-              </div>
-            )}
+        const messageCount = threadMessages?.length || 0;
 
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2 mb-1 flex-wrap">
-                <span className="text-xs font-semibold text-indigo-700">
-                  Thread #{String(summary.threadID || "").slice(0, 8)}
-                </span>
+        return (
+          <div className="bg-white rounded-xl border-2 border-indigo-100 shadow-sm hover:shadow-md transition-all duration-200">
+            <div className="p-3 cursor-pointer" onClick={() => setExpanded(!expanded)}>
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-start gap-2 flex-1">
+                  {index !== undefined && (
+                    <div
+                      className={`flex-shrink-0 w-6 h-6 rounded-full bg-gradient-to-br ${userColor} flex items-center justify-center text-white text-xs font-bold`}
+                    >
+                      {index + 1}
+                    </div>
+                  )}
 
-                {messageCount > 0 && (
-                  <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-medium">
-                    {messageCount} message{messageCount !== 1 ? "s" : ""}
-                  </span>
-                )}
-
-                <span className="text-xs text-gray-500">
-                  {getRelativeTime(summary.generatedAt)}
-                </span>
-
-                {summary.closedByUserName && (
-                  <span className="text-xs text-gray-500 flex items-center gap-1">
-                    by{" "}
-                    <span className="font-medium text-gray-700">
-                      {summary.closedByUserName}
-                    </span>
-                    {summary.closedByRole && (
-                      <span title={summary.closedByRole}>
-                        {getRoleEmoji(summary.closedByRole)}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <span className="text-xs font-semibold text-indigo-700">
+                        Thread #{String(summary.threadID || "").slice(0, 8)}
                       </span>
-                    )}
-                  </span>
-                )}
+
+                      {messageCount > 0 && (
+                        <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-medium">
+                          {messageCount} message{messageCount !== 1 ? "s" : ""}
+                        </span>
+                      )}
+
+                      <span className="text-xs text-gray-500">
+                        {getRelativeTime(summary.generatedAt)}
+                      </span>
+
+                      {summary.closedByUserName && (
+                        <span className="text-xs text-gray-500 flex items-center gap-1">
+                          by{" "}
+                          <span className="font-medium text-gray-700">
+                            {summary.closedByUserName}
+                          </span>
+                          {summary.closedByRole && (
+                            <span title={summary.closedByRole}>
+                              {getRoleEmoji(summary.closedByRole)}
+                            </span>
+                          )}
+                        </span>
+                      )}
+                    </div>
+
+                    <p
+                      className={`text-sm text-gray-700 leading-relaxed ${
+                        !expanded ? "line-clamp-2" : ""
+                      }`}
+                    >
+                      {summary.summaryText}
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  className="flex-shrink-0 text-indigo-600 hover:text-indigo-800 transition-transform duration-200"
+                  style={{ transform: expanded ? "rotate(180deg)" : "rotate(0deg)" }}
+                  type="button"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                  </svg>
+                </button>
               </div>
-
-              <p className={`text-sm text-gray-700 leading-relaxed ${!expanded ? "line-clamp-2" : ""}`}>
-                {summary.summaryText}
-              </p>
             </div>
-          </div>
 
-          <button
-            className="flex-shrink-0 text-indigo-600 hover:text-indigo-800 transition-transform duration-200"
-            style={{ transform: expanded ? "rotate(180deg)" : "rotate(0deg)" }}
-            type="button"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-            </svg>
-          </button>
-        </div>
-      </div>
+            {expanded && (
+              <div className="px-3 pb-3 pt-0">
+                <div className="bg-gradient-to-br from-gray-50 to-blue-50 p-3 rounded-lg border border-gray-200 mb-3">
+                  <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">
+                    {summary.summaryText}
+                  </p>
+                </div>
 
-      {expanded && (
-        <div className="px-3 pb-3 pt-0">
-          <div className="bg-gradient-to-br from-gray-50 to-blue-50 p-3 rounded-lg border border-gray-200 mb-3">
-            <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">
-              {summary.summaryText}
-            </p>
-          </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleCopy}
+                    className="flex-1 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg font-semibold text-sm hover:bg-gray-200 transition-all duration-200 flex items-center justify-center gap-2"
+                    type="button"
+                  >
+                    {copied ? "✓ Copied!" : "📋 Copy"}
+                  </button>
 
-          <div className="flex gap-2">
-            <button
-              onClick={handleCopy}
-              className="flex-1 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg font-semibold text-sm hover:bg-gray-200 transition-all duration-200 flex items-center justify-center gap-2"
-              type="button"
-            >
-              {copied ? "✓ Copied!" : "📋 Copy"}
-            </button>
-
-            {showOpenButton && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onOpenThread && onOpenThread(summary.parentMessageID);
-                }}
-                className="flex-1 bg-gradient-to-r from-indigo-600 to-blue-600 text-white px-4 py-2 rounded-lg font-semibold text-sm hover:from-indigo-700 hover:to-blue-700 transition-all duration-200 flex items-center justify-center gap-2 shadow-sm"
-                type="button"
-              >
-                Open Thread
-              </button>
+                  {showOpenButton && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOpenThread && onOpenThread(summary.parentMessageID);
+                      }}
+                      className="flex-1 bg-gradient-to-r from-indigo-600 to-blue-600 text-white px-4 py-2 rounded-lg font-semibold text-sm hover:from-indigo-700 hover:to-blue-700 transition-all duration-200 flex items-center justify-center gap-2 shadow-sm"
+                      type="button"
+                    >
+                      Open Thread
+                    </button>
+                  )}
+                </div>
+              </div>
             )}
           </div>
-        </div>
-      )}
-    </div>
-  );
-}
+        );
+      }
+
 
 /* ----------------- THREAD INPUT ----------------- */
 function ThreadInput({ parentMessageID, onSend, inputRef, disabled }) {

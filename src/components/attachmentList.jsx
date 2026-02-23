@@ -5,10 +5,7 @@ export default function AttachmentList({ attachments = [] }) {
   if (!attachments || attachments.length === 0) return null;
 
   return (
-    // IMPORTANT:
-    // pointer-events-none ensures this whole block cannot "sit on top" and block
-    // clicks on Ask AI / Create Task / Start Thread.
-    // Then we selectively re-enable pointer events for interactive things.
+    // pointer-events-none so this block can’t block buttons under it
     <div className="mt-2 space-y-2 pointer-events-none">
       {attachments.map((a, idx) => (
         <div
@@ -35,9 +32,16 @@ export default function AttachmentList({ attachments = [] }) {
           </div>
 
           <div className="text-[11px] text-gray-600 mt-1">
-            {a.contentType || "unknown type"} • {Math.round((a.size || 0) / 1024)}{" "}
-            KB
+            {a.contentType || "unknown type"} •{" "}
+            {Math.round((a.size || 0) / 1024)} KB
           </div>
+
+          {/* NEW: show image description if present */}
+          {a.imageDescription && (
+            <p className="mt-1 ml-1 text-[11px] text-gray-700 italic pointer-events-auto">
+              “{a.imageDescription}”
+            </p>
+          )}
 
           {a.text && (
             // Re-enable pointer events for selecting/copying/scrolling in preview
