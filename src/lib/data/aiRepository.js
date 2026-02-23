@@ -1,11 +1,15 @@
 // src/lib/data/aiRepository.js
 
-export async function callGeminiAPI(userText, model) {
+export async function callGeminiAPI(userText, model, history = []) {
   try {
     const response = await fetch("/api/ai", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: userText, model }),
+      body: JSON.stringify({
+        message: userText,
+        model,
+        history, // send context
+      }),
     });
 
     const data = await response.json().catch(() => ({}));
@@ -20,7 +24,6 @@ export async function callGeminiAPI(userText, model) {
     }
 
     if (!response.ok) {
-      // Keep useful error detail if server returned it
       const msg =
         typeof data?.error === "string"
           ? data.error

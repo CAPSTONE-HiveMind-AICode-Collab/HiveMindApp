@@ -9,38 +9,80 @@ function safeName(name) {
   return name.replace(/[^\w.\-() ]+/g, "_");
 }
 
-// Reads small text files client-side (txt/csv/md).
+/**
+ * Reads small text files on the client (txt / csv / md).
+ * Returns trimmed text or null.
+ */
 async function maybeReadText(file) {
+  const lower = file.name.toLowerCase();
   const isTextLike =
     file.type.startsWith("text/") ||
-    file.name.toLowerCase().endsWith(".txt") ||
-    file.name.toLowerCase().endsWith(".csv") ||
-    file.name.toLowerCase().endsWith(".md");
+    lower.endsWith(".txt") ||
+    lower.endsWith(".csv") ||
+    lower.endsWith(".md");
 
   if (!isTextLike) return null;
 
   const text = await file.text();
-  const MAX = 80_000;
+  const MAX = 80_000; // safety limit for prompt size
   return text.length > MAX ? text.slice(0, MAX) + "\n\n[TRUNCATED]" : text;
 }
 
-// Server-side PDF text extraction
+/**
+ * Ask Next.js API to extract text from a PDF by URL.
+ * This will hit /api/extract/pdf which you already created.
+ */
 async function extractPdfTextFromServer(downloadUrl) {
-  const res = await fetch("/api/extract/pdf", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url: downloadUrl }),
-  });
+  try {
+    const res = await fetch("/api/extract/pdf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: downloadUrl }),
+    });
 
-  const data = await res.json().catch(() => ({}));
+    const data = await res.json().catch(() => ({}));
 
-  if (!res.ok) {
-    // Don’t fail upload; just return null text
-    console.warn("PDF extract failed:", data?.error || res.statusText);
+    if (!res.ok) {
+      console.warn("PDF extract failed:", data?.error || res.statusText);
+      return null;
+    }
+
+    return data?.text || null;
+  } catch (err) {
+    console.warn("PDF extract error:", err);
     return null;
   }
+}
 
-  return data?.text || null;
+/**
+ * Ask Next.js API to get an image description by URL.
+ * This will call /api/image-caption, which proxies to your FastAPI BLIP server.
+ */
+async function getImageDescriptionFromServer(downloadUrl) {
+  try {
+    const res = await fetch("/api/image-caption", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        // send both keys so route.js can choose either shape
+        image_url: downloadUrl,
+        imageUrl: downloadUrl,
+        max_tokens: 40,
+      }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      console.warn("Image caption failed:", data?.error || res.statusText);
+      return null;
+    }
+
+    return data?.description || null;
+  } catch (err) {
+    console.warn("Image caption error:", err);
+    return null;
+  }
 }
 
 export default function FileUploader({ hiveID, honeycombID, userId, onUploaded }) {
@@ -88,16 +130,25 @@ export default function FileUploader({ hiveID, honeycombID, userId, onUploaded }
           try {
             const url = await getDownloadURL(uploadTask.snapshot.ref);
 
-            // Extract text based on file type
             const lowerName = file.name.toLowerCase();
             const isPdf =
               file.type === "application/pdf" || lowerName.endsWith(".pdf");
+            const isImage =
+              file.type.startsWith("image/") &&
+              !lowerName.endsWith(".svg"); // skip svg for now
 
             let extractedText = null;
+            let imageDescription = null;
 
             if (isPdf) {
+              // Server-side PDF parser
               extractedText = await extractPdfTextFromServer(url);
+            } else if (isImage) {
+              // Local BLIP caption via Next API
+              imageDescription = await getImageDescriptionFromServer(url);
+              extractedText = imageDescription; // also treat as text for Ask AI
             } else {
+              // Plain text / csv / md
               extractedText = await maybeReadText(file);
             }
 
@@ -108,8 +159,11 @@ export default function FileUploader({ hiveID, honeycombID, userId, onUploaded }
               url,
               storagePath,
               uploadedAt: Date.now(),
-              text: extractedText,
+              text: extractedText,          // generic text for AI context
+              imageDescription,             // for images
             };
+
+            console.log("UPLOAD META", meta);
 
             onUploaded?.(meta);
           } catch (doneErr) {
@@ -131,7 +185,12 @@ export default function FileUploader({ hiveID, honeycombID, userId, onUploaded }
 
   return (
     <div className="flex items-center gap-2">
-      <input ref={inputRef} type="file" className="hidden" onChange={onChange} />
+      <input
+        ref={inputRef}
+        type="file"
+        className="hidden"
+        onChange={onChange}
+      />
 
       <button
         type="button"
