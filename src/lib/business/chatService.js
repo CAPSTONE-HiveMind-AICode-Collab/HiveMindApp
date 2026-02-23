@@ -20,7 +20,7 @@ import { callGeminiAPI } from "@/lib/data/aiRepository";
 import { updateThreadStatus, getThreadParticipants } from "@/lib/data/firestoreRepository";
 import { scheduleTimeBasedNotification, notifyUsers } from "@/lib/business/notificationService";
 import { generateAndStoreThreadSummary } from "@/lib/data/summaryRepository";
-import { isToxicMessage } from "@/lib/business/ToxicityService";
+import { isToxicMessage, getToxicityDetails } from "@/lib/business/ToxicityService";
 /* ----------------- Notifications -----------------*/
 
 /* ----------------- Helpers ----------------- */
@@ -49,11 +49,21 @@ export function useSendUserMessage() {
   const sendMessage = async (text, hiveID, honeycombID) => {
     if (!user) throw new Error("User not authenticated");
 
-    // 1️⃣ Local Tensor model toxicity check
+    // 1️⃣ Local TensorFlow toxicity check (client-side, before Firestore write)
+    // Runs the BERT-based @tensorflow-models/toxicity classifier locally.
+    // No message text is sent to an external server for this check.
     const toxic = await isToxicMessage(text);
     if (toxic) {
-       alert("Your message appears toxic — please revise and try again.");
-       return;
+      // Get detailed label breakdown so the user understands what was flagged
+      const details = await getToxicityDetails(text);
+      const flagged = details
+        .filter((d) => d.match)
+        .map((d) => d.label.replace(/_/g, " "))
+        .join(", ");
+      alert(
+        `Your message was blocked by the content safety filter.\n\nFlagged category: ${flagged || "toxicity"}.\n\nPlease revise your message and try again.`
+      );
+      return;
     }
 
     // 2️⃣ Save to Firestore normally
@@ -217,11 +227,18 @@ export function useSendThreadMessage() {
   const sendThreadMessage = async (text, hiveID, honeycombID, parentMessageID) => {
     if (!user) throw new Error("User not authenticated");
 
-    // 1️⃣ Tensor toxicity model
+    // 1️⃣ TensorFlow toxicity check (client-side)
     const toxic = await isToxicMessage(text);
     if (toxic) {
-       alert("Your message appears toxic — please revise and try again.");
-       return;
+      const details = await getToxicityDetails(text);
+      const flagged = details
+        .filter((d) => d.match)
+        .map((d) => d.label.replace(/_/g, " "))
+        .join(", ");
+      alert(
+        `Your message was blocked by the content safety filter.\n\nFlagged category: ${flagged || "toxicity"}.\n\nPlease revise your message and try again.`
+      );
+      return;
     }
 
     // 2️⃣ Add reply normally
