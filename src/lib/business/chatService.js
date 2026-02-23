@@ -256,7 +256,8 @@ export function useSendThreadMessage() {
   return sendThread;
 }
   */
-
+ 
+//THREAD CREATION METHOD
 export function useSendThreadMessage() {
   const { user } = useUser();
 
@@ -612,3 +613,23 @@ export async function sendAssistantAIReply(promptText, uid) {
     });
   }
 }
+
+//-----------Close thread and save thread to memory----------//
+export const closeThread = async (hiveId, threadId, messages) => {
+  // Step 1: Normal closure logic (Update status in Firestore)
+  await updateThreadStatus(threadId, "closed");
+
+  // Step 2: MANUAL NECTAR EXTRACTION
+  // Format the context for the AI
+  const threadContext = messages
+    .map(m => `${m.sender}: ${m.text}`)
+    .join("\n");
+
+  try {
+    console.log("Distilling Knowledge Nectar...");
+    await NectarRepository.distillAndSave(hiveId, threadContext);
+    console.log("Nectar saved to Hive Memory!");
+  } catch (error) {
+    console.error("Nectar extraction failed, but thread was closed.", error);
+  }
+};

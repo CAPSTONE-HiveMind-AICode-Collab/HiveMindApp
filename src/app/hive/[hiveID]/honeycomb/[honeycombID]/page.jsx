@@ -17,7 +17,8 @@ import {
 } from "@/lib/business/chatService";
 
 import { useUser } from "@/lib/auth/userContext";
-import { callGeminiAPI } from "@/lib/data/aiRepository";
+import { callGeminiAPI, askHiveMemory } from "@/lib/data/aiRepository";
+import { NectarRepository } from "@/lib/data/nectarRepository";
 import { buildAskAIContext } from "@/lib/business/contextBuilderService";
 import { db } from "@/lib/firebase/config";
 import {
@@ -157,6 +158,28 @@ export default function HoneycombChatPage() {
     };
     return roleMap[role] || "👤";
   };
+
+  // --- State: Knowledge Nectar (Memory) ---
+const [memoryQuery, setMemoryQuery] = useState("");
+const [memoryResponse, setMemoryResponse] = useState("");
+const [isSearchingMemory, setIsSearchingMemory] = useState(false);
+
+// The logic handler for the RAG search
+const handleSearchMemory = async (e) => {
+  e.preventDefault();
+  if (!memoryQuery.trim()) return;
+  setIsSearchingMemory(true);
+  setMemoryResponse("");
+  try {
+    const answer = await askHiveMemory(hiveID, memoryQuery, selectedModel);
+    setMemoryResponse(answer);
+  } catch (err) {
+    console.error("Memory search failed:", err);
+    setMemoryResponse("Failed to access Hive memory.");
+  } finally {
+    setIsSearchingMemory(false);
+  }
+};
 
   /* ----------------- VOICE-TO-TEXT SETUP (Web Speech API) ----------------- */
   useEffect(() => {
@@ -1181,6 +1204,12 @@ export default function HoneycombChatPage() {
           summaries={summaries}
           summariesLoading={summariesLoading}
           onOpenThread={handleOpenThread}
+
+          memoryQuery={memoryQuery}
+          setMemoryQuery={setMemoryQuery}
+          memoryResponse={memoryResponse}
+          handleSearchMemory={handleSearchMemory}
+          isSearchingMemory={isSearchingMemory}
         />
       )}
 
@@ -1210,6 +1239,11 @@ function ThreadPanel({
   loadSummaries,
   summaries,
   onOpenThread,
+  memoryQuery,
+  setMemoryQuery,
+  memoryResponse,
+  handleSearchMemory,
+  isSearchingMemory
 }) {
   const canChat = userRole ? checkPermission(userRole, "SEND_MESSAGE") : true;
 
@@ -1350,6 +1384,58 @@ function ThreadPanel({
   const threadStatus = currentThread[0]?.status || "open";
   const threadClosed = threadStatus === "closed";
 
+  const handleToggleThreadStatus = async () => {
+    const currentStatus = currentThread[0]?.status || "open";
+
+    if (currentStatus === "open") {
+      // 1. Standard L3/L4 Closure & Notification
+      await closeThreadAndNotify(
+        hiveID,
+        honeycombID,
+        activeThreadMessageID,
+        currentThread[0].id,
+        user
+      );
+
+      // 2. Advanced CS: Knowledge Nectar Distillation
+      try {
+        console.log("🐝 HiveMind is distilling Knowledge Nectar...");
+        
+        // Ensure we combine the parent message and all replies for full context
+        const fullDiscussionContext = `
+          PRIMARY QUESTION/TOPIC: ${parentMessage?.text || "No topic provided"}
+          
+          TEAM DISCUSSION:
+          ${currentThread.map(m => `${m.sender}: ${m.text}`).join("\n")}
+        `;
+
+        // L4 Repository call to AI Gateway
+        await NectarRepository.distillAndSave(hiveID, fullDiscussionContext);
+        
+        console.log("🍯 Knowledge Nectar successfully stored in Hive Memory!");
+      } catch (err) {
+        // We catch errors here so the UI doesn't crash if the AI fails
+        console.error("Knowledge Nectar extraction failed:", err);
+      }
+
+      // 3. UI Refresh
+      try {
+        await loadSummaries();
+      } catch (err) {
+        console.error("Failed to refresh summaries after close:", err);
+      }
+    } else {
+      // Reopen logic
+      await setThreadStatus(
+        hiveID,
+        honeycombID,
+        activeThreadMessageID,
+        currentThread[0].id,
+        "open"
+      );
+    }
+  };
+
   return (
     <div
       ref={panelRef}
@@ -1418,7 +1504,27 @@ function ThreadPanel({
           </div>
         ))}
       </div>
-
+        <div className="p-4 bg-indigo-900 text-white rounded-xl shadow-lg mb-6 border-b-4 border-indigo-700">
+  <h3 className="text-sm font-bold flex items-center gap-2 mb-3">🧠 Ask Hive Mind</h3>
+  <input 
+    value={memoryQuery} 
+    onChange={(e) => setMemoryQuery(e.target.value)} 
+    className="w-full p-3 rounded text-white text-sm mb-2" 
+    placeholder="Ask a previous decision..." 
+  />
+  <button 
+    onClick={handleSearchMemory} 
+    disabled={isSearchingMemory}
+    className="w-full bg-yellow-400 hover:bg-yellow-500 text-indigo-900 font-bold py-2 rounded text-xs transition-colors"
+  >
+    {isSearchingMemory ? "Thinking..." : "Query Memory"}
+  </button>
+  {memoryResponse && (
+    <div className="mt-2 text-xs bg-indigo-800 p-2 rounded border border-indigo-600 animate-in fade-in">
+      {memoryResponse}
+    </div>
+  )}
+</div>
       <ThreadInput
         parentMessageID={activeThreadMessageID}
         onSend={onSend}
@@ -1428,57 +1534,29 @@ function ThreadPanel({
 
       {currentThread[0]?.senderId === user.uid && canChat && (
         <button
-          onClick={async () => {
-            const currentStatus = currentThread[0]?.status || "open";
-
-            if (currentStatus === "open") {
-              await closeThreadAndNotify(
-                hiveID,
-                honeycombID,
-                activeThreadMessageID,
-                currentThread[0].id,
-                user
-              );
-
-              try {
-                await loadSummaries();
-              } catch (err) {
-                console.error("Failed to refresh summaries after close:", err);
-              }
-            } else {
-              await setThreadStatus(
-                hiveID,
-                honeycombID,
-                activeThreadMessageID,
-                currentThread[0].id,
-                "open"
-              );
-            }
-          }}
-          className={`mt-2 px-4 py-2 rounded-md font-semibold ${
-            threadClosed
-              ? "bg-green-500 text-white hover:bg-green-600"
-              : "bg-red-500 text-white hover:bg-red-600"
-          }`}
-          type="button"
-        >
-          {threadClosed ? "Reopen Thread" : "Close Thread"}
-        </button>
+  onClick={handleToggleThreadStatus} // Much cleaner!
+  className={`mt-2 px-4 py-2 rounded-md font-semibold ${
+    threadClosed
+      ? "bg-green-500 text-white hover:bg-green-600"
+      : "bg-red-500 text-white hover:bg-red-600"
+  }`}
+  type="button"
+>
+  {threadClosed ? "Reopen Thread" : "Close Thread"}
+</button>
       )}
-
-  
-        {threadClosed &&
-          (() => {
-            const threadSummary = (summaries || []).find(
-              (s) => s.threadID === currentThread[0]?.id
-            );
-
-            return threadSummary ? (
-              <div className="mt-4 bg-gradient-to-br from-indigo-50 via-blue-50 to-cyan-50 border-2 border-indigo-200 rounded-2xl shadow-lg overflow-hidden">
-                <div className="bg-gradient-to-r from-indigo-600 to-blue-600 px-4 py-3 flex items-center gap-2">
-                  <span className="text-2xl">✨</span>
-                  <h2 className="text-base font-bold text-white">Thread Summary</h2>
-                </div>
+      {/* Summary only for this thread if closed */}
+      {threadClosed &&
+        (() => {
+          const threadSummary = (summaries || []).find(
+            (s) => s.threadID === currentThread[0]?.id
+          );
+          return threadSummary ? (
+            <div className="mt-4 bg-gradient-to-br from-indigo-50 via-blue-50 to-cyan-50 border-2 border-indigo-200 rounded-2xl shadow-lg overflow-hidden">
+              <div className="bg-gradient-to-r from-indigo-600 to-blue-600 px-4 py-3 flex items-center gap-2">
+                <span className="text-2xl">✨</span>
+                <h2 className="text-base font-bold text-white">Thread Summary</h2>
+              </div>
 
                 <div className="p-4">
                   <SummaryCard

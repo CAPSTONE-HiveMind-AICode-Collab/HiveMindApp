@@ -11,6 +11,7 @@ import MonitoringDashboard from "@/components/MonitoringDashboard";
 import AuditLogViewer from "@/components/AuditLogViewer";
 import IAMAdminPanel from "@/components/IAMAdminPanel";
 import PermissionBadge from "@/components/PermissionBadge";
+import HiveGuard from "@/components/HiveGuard";
 
 export default function HivePage() {
   const { hiveID } = useParams();
@@ -236,6 +237,20 @@ export default function HivePage() {
           >
             🔐 IAM Admin
           </button>
+          <button
+            onClick={() => setActiveTab("HiveGuard")}
+            style={{
+              padding: "10px 20px",
+              border: "none",
+              backgroundColor: activeTab === "HiveGuard" ? "#d4af37" : "transparent",
+              color: activeTab === "HiveGuard" ? "#fff" : "#d4af37",
+              fontWeight: "bold",
+              cursor: "pointer",
+              borderRadius: "5px 5px 0 0",
+            }}
+          >
+            🔐 HiveGuard
+          </button>
         </div>
       )}
 
@@ -433,6 +448,12 @@ export default function HivePage() {
       {activeTab === "iam" && userRole === "OWNER" && (
         <div style={{ marginTop: "30px" }}>
           <IAMAdminPanel hiveID={hiveID} />
+        </div>
+      )}
+
+      {activeTab === "HiveGuard" && userRole === "OWNER" && (
+        <div style={{ marginTop: "30px" }}>
+          <HiveGuard hiveID={hiveID} currentUserRole={userRole} />
         </div>
       )}
     </div>
