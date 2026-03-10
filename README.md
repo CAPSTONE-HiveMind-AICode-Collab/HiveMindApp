@@ -110,3 +110,16 @@ The endpoint creates a sample Hive called "demo-hive" with a Honeycomb "general"
 
 ---
 
+
+
+DOCKER INSTRICTIONS *WIP*(Make sure to run it from where you have the project files!):
+docker build -t hivemind-test .
+
+docker-compose up --build
+
+
+
+
+
+
+
