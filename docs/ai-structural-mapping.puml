@@ -1,0 +1,83 @@
+@startuml
+title Structural Overview - Honeycomb AI Context (Modules & Components)
+skinparam componentStyle rectangle
+
+package "Client (Next.js / React)" {
+  [HoneycombChatPage\nsrc/app/hive/[hiveID]/honeycomb/[honeycombID]/page.jsx] as Page
+  [FileUploader\nsrc/components/fileUploader.jsx] as Uploader
+  [AttachmentList\nsrc/components/attachmentList.jsx] as AttachList
+  [CreateTaskModal\nsrc/components/CreateTaskModal.jsx] as TaskModal
+  [CodeBlock\nsrc/components/CodeBlock.jsx] as CodeBlock
+}
+
+package "Business Layer" {
+  [chatService.js\nsrc/lib/business/chatService.js] as ChatSvc
+  [permissionService.js\nsrc/lib/business/permissionService.js] as PermSvc
+  [notificationService.js\nsrc/lib/business/notificationService.js] as NotifSvc
+  [ToxicityService.js\nsrc/lib/business/ToxicityService.js] as ToxicSvc
+}
+
+package "Data Layer" {
+  [aiRepository.js\nsrc/lib/data/aiRepository.js] as AIRepo
+  [taskRepository.js\nsrc/lib/data/taskRepository.js] as TaskRepo
+  [summaryRepository.js\nsrc/lib/data/summaryRepository.js] as SumRepo
+  [firestoreRepository.js\nsrc/lib/data/firestoreRepository.js] as FSRepo
+}
+
+package "Server (Next.js API Routes)" {
+  [AI Route\nsrc/app/api/ai/route.js] as AIRoute
+  [PDF Extract Route\nsrc/app/api/extract/pdf/route.js] as PdfRoute
+}
+
+package "Firebase" {
+  [Firestore] as Firestore
+  [Storage] as Storage
+}
+
+package "External AI" {
+  [Google Gemini\n@google/genai] as Gemini
+}
+
+' ---- UI dependencies ----
+Page --> ChatSvc : send/subscribe messages & threads\nupdateLastSeen/loadOlderMessages/closeThreadAndNotify
+Page --> PermSvc : checkPermission()
+Page --> AIRepo : callGeminiAPI(prompt, model, history)
+Page --> TaskRepo : createTaskFromMessage()
+Page --> SumRepo : listThreadSummaries()
+Page --> AttachList : render attachments
+Page --> TaskModal : create task UI
+Page --> CodeBlock : render code blocks
+Page --> Uploader : onUploaded(meta) (queue attachments)
+
+Uploader --> Storage : uploadBytesResumable()\ngetDownloadURL()
+Uploader --> PdfRoute : POST /api/extract/pdf { url }
+Uploader --> Page : onUploaded(meta)
+
+AttachList --> Page : display meta/text/url
+
+' ---- Business layer dependencies ----
+ChatSvc --> Firestore : addDoc(), onSnapshot(), query(), setDoc(), getDocs()
+ChatSvc --> ToxicSvc : isToxicMessage()
+ChatSvc --> NotifSvc : notifyUsers(), scheduleTimeBasedNotification()
+ChatSvc --> FSRepo : updateThreadStatus(), getThreadParticipants()
+ChatSvc --> SumRepo : generateAndStoreThreadSummary()
+ChatSvc --> AIRepo : callGeminiAPI() for assistant/AI replies
+
+PermSvc ..> Firestore : (reads roles/members)
+
+' ---- Data layer dependencies ----
+AIRepo --> AIRoute : fetch("/api/ai") POST { message, model, history }
+TaskRepo --> Firestore : write tasks + linking to message IDs
+SumRepo --> Firestore : write/read threadSummaries
+FSRepo --> Firestore : thread status + participants
+
+' ---- API routes dependencies ----
+AIRoute --> Gemini : models.generateContent()
+PdfRoute --> Storage : download PDF (via url)
+PdfRoute --> Firestore : (optional) store extracted text
+
+' ---- External/fallback providers ----
+AIRoute ..> Firestore : uses firebase model fallback (if configured)
+AIRoute ..> Gemini : primary provider when GEMINI_API_KEY exists
+
+@enduml

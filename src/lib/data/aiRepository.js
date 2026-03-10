@@ -24,7 +24,7 @@ const RESPONSE_EXAMPLES = {
  * The server-side route verifies this token with the Admin SDK before
  * processing the request, ensuring only authenticated users can invoke AI.
  */
-export async function callGeminiAPI(userText, model) {
+export async function callGeminiAPI(userText, model, history = []) {
   try {
     // Obtain the short-lived Firebase ID token for the current user.
     // getIdToken(false) returns the cached token; it refreshes automatically
@@ -40,7 +40,7 @@ export async function callGeminiAPI(userText, model) {
     const response = await fetch("/api/ai", {
       method: "POST",
       headers,
-      body: JSON.stringify({ message: userText, model }),
+      body: JSON.stringify({ message: userText, model, history }),
     });
 
     const data = await response.json().catch(() => ({}));

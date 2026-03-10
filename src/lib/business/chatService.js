@@ -42,46 +42,92 @@ const normalizeAttachment = (attachment) => {
   return Array.isArray(attachment) ? attachment : [attachment];
 };
 
-/* ----------------- USER MESSAGES ----------------- */
 export function useSendUserMessage() {
   const { user } = useUser();
 
-  const sendMessage = async (text, hiveID, honeycombID) => {
+  // NOTE: keep signature compatible with your chat page:
+  // sendUserMessage(text, hiveID, honeycombID, [], pendingAttachments)
+  const sendMessage = async (
+    text,
+    hiveID,
+    honeycombID,
+    allUserIds = [],
+    attachment = null
+  ) => {
     if (!user) throw new Error("User not authenticated");
 
-    // 1️⃣ Local TensorFlow toxicity check (client-side, before Firestore write)
-    // Runs the BERT-based @tensorflow-models/toxicity classifier locally.
-    // No message text is sent to an external server for this check.
-    const toxic = await isToxicMessage(text);
-    if (toxic) {
-      // Get detailed label breakdown so the user understands what was flagged
-      const details = await getToxicityDetails(text);
-      const flagged = details
-        .filter((d) => d.match)
-        .map((d) => d.label.replace(/_/g, " "))
-        .join(", ");
-      alert(
-        `Your message was blocked by the content safety filter.\n\nFlagged category: ${flagged || "toxicity"}.\n\nPlease revise your message and try again.`
-      );
-      return;
+    const cleanedText = String(text || "").trim();
+    const normalized = normalizeAttachment(attachment); // array or null
+    const hasAttachments = Array.isArray(normalized) && normalized.length > 0;
+
+    // Toxicity check only when there is text to analyze
+    if (cleanedText) {
+      const toxic = await isToxicMessage(cleanedText);
+      if (toxic) {
+        // Get detailed label breakdown so the user understands what was flagged
+        const details = await getToxicityDetails(cleanedText);
+        const flagged = details
+          .filter((d) => d.match)
+          .map((d) => d.label.replace(/_/g, " "))
+          .join(", ");
+        alert(
+          `Your message was blocked by the content safety filter.\n\nFlagged category: ${flagged || "toxicity"}.\n\nPlease revise your message and try again.`
+        );
+        return;
+      }
+    }
     }
 
-    // 2️⃣ Save to Firestore normally
+    //  allow “attachments-only” messages
+    if (!cleanedText && !hasAttachments) return;
+
     const messagesRef = collection(
-      db, "Hive", hiveID, "Honeycomb", honeycombID, "messages"
+      db,
+      "Hive",
+      String(hiveID),
+      "Honeycomb",
+      String(honeycombID),
+      "messages"
     );
 
-    await addDoc(messagesRef, {
-      text,
-      sender: user.displayName,
+    const msgRef = await addDoc(messagesRef, {
+      type: hasAttachments ? "file" : "text",
+      text: cleanedText,
+      attachment: normalized, 
+      sender: user.displayName || user.email || "User",
       senderId: user.uid,
       timestamp: serverTimestamp(),
     });
+
+    //initialize userStatus docs for all users (except sender)
+    const ids = normalizeUserIds(allUserIds);
+    await Promise.all(
+      ids
+        .filter((uid) => uid && uid !== user.uid)
+        .map((uid) =>
+          setDoc(
+            doc(
+              db,
+              "Hive",
+              String(hiveID),
+              "Honeycomb",
+              String(honeycombID),
+              "messages",
+              msgRef.id,
+              "userStatus",
+              String(uid)
+            ),
+            { lastSeen: null },
+            { merge: true }
+          )
+        )
+    );
+
+    return msgRef.id;
   };
 
   return sendMessage;
 }
-
 
 
 /*
