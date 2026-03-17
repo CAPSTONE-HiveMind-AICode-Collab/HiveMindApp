@@ -80,6 +80,13 @@ export default function MonitoringDashboard({ hiveID }) {
 
         const storageCost = 0.02; // Assume minimal storage for now
 
+        // ── FinOps: Trends Analysis (compare vs. last week) ─────────────────
+        // For simplicity in this demo, we mock "last week" as 80% of current.
+        // In a real app, you would fetch historical snapshots from Firestore.
+        const lastWeekMessages = Math.floor(totalMessages * 0.8); 
+        const messageTrend = totalMessages - lastWeekMessages;
+        const messageGrowth = lastWeekMessages > 0 ? ((messageTrend / lastWeekMessages) * 100).toFixed(1) : 0;
+
         setStats({
           totalMessages,
           totalThreads,
@@ -90,6 +97,10 @@ export default function MonitoringDashboard({ hiveID }) {
             storage: storageCost,
             total: firestoreCost + geminiCost + storageCost,
           },
+          trends: {
+            messageGrowth: Number(messageGrowth),
+            costStatus: (firestoreCost + geminiCost) > 5.00 ? "CRITICAL" : "HEALTHY"
+          }
         });
       } catch (err) {
         console.error("Failed to load stats:", err);
@@ -126,17 +137,32 @@ export default function MonitoringDashboard({ hiveID }) {
       </div>
 
       {/* Usage Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        {/* Messages Card */}
         <div className="bg-white rounded-lg border-2 border-blue-200 p-6">
-          <div className="flex items-center justify-between mb-3">
-            <div className="bg-blue-100 rounded-full p-3">
-              <svg className="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-              </svg>
+          <div className="flex justify-between items-start">
+            <div>
+              <p className="text-3xl font-bold text-gray-800">{stats.totalMessages.toLocaleString()}</p>
+              <p className="text-sm text-gray-600 mt-1">Total Messages</p>
             </div>
+            <span className={`text-xs px-2 py-1 rounded-full ${stats.trends?.messageGrowth > 0 ? 'bg-green-100 text-green-700' : 'bg-gray-100'}`}>
+              {stats.trends?.messageGrowth > 0 ? "+" : ""}{stats.trends?.messageGrowth}%
+            </span>
           </div>
-          <p className="text-3xl font-bold text-gray-800">{stats.totalMessages.toLocaleString()}</p>
-          <p className="text-sm text-gray-600 mt-1">Total Messages</p>
+        </div>
+
+        {/* Cost Health Card */}
+        <div className={`bg-white rounded-lg border-2 p-6 ${stats.trends?.costStatus === 'CRITICAL' ? 'border-red-300 bg-red-50' : 'border-green-300'}`}>
+           <div className="flex justify-between items-start">
+            <div>
+              <p className="text-3xl font-bold text-gray-800">${stats.estimatedCosts.total.toFixed(2)}</p>
+              <p className="text-sm text-gray-600 mt-1">Est. Monthly Cost</p>
+            </div>
+            <span className={`text-xs font-bold px-2 py-1 rounded ${stats.trends?.costStatus === 'CRITICAL' ? 'bg-red-200 text-red-800' : 'bg-green-200 text-green-800'}`}>
+              {stats.trends?.costStatus}
+            </span>
+          </div>
+          <p className="text-xs text-gray-500 mt-2">Target: &lt; $5.00/mo</p>
         </div>
 
         <div className="bg-white rounded-lg border-2 border-purple-200 p-6">
