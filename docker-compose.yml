@@ -16,3 +16,35 @@ services:
     env_file:
       - .env.local
     restart: always
+
+  #Looks at your Docker engine usage "monitoring"
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: hivemind-monitor
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+
+  #Collects the data or the "brain" of your monitoring toolset
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hivemind-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  #The dashboard showing all container data
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hivemind-grafana
+    ports:
+      - "3001:3000" # Access at http://localhost:3001
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin # Default login is admin/admin
+
+  
