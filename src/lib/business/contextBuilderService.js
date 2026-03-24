@@ -8,6 +8,64 @@ export const ASK_AI_SCOPES = {
   ENTIRE_CHAT: "entire_chat",
 };
 
+export const AI_SCOPE_OPTIONS = [
+  { value: ASK_AI_SCOPES.MESSAGE_ONLY, label: "This message only" },
+  { value: ASK_AI_SCOPES.LAST_5, label: "Last 5 messages" },
+  { value: ASK_AI_SCOPES.LAST_20, label: "Last 20 messages" },
+  { value: ASK_AI_SCOPES.ENTIRE_CHAT, label: "Entire chat" },
+];
+
+const ROLE_SCOPE_POLICY = {
+  OWNER: [
+    ASK_AI_SCOPES.MESSAGE_ONLY,
+    ASK_AI_SCOPES.LAST_5,
+    ASK_AI_SCOPES.LAST_20,
+    ASK_AI_SCOPES.ENTIRE_CHAT,
+  ],
+  ADMIN: [
+    ASK_AI_SCOPES.MESSAGE_ONLY,
+    ASK_AI_SCOPES.LAST_5,
+    ASK_AI_SCOPES.LAST_20,
+    ASK_AI_SCOPES.ENTIRE_CHAT,
+  ],
+  MEMBER: [
+    ASK_AI_SCOPES.MESSAGE_ONLY,
+    ASK_AI_SCOPES.LAST_5,
+    ASK_AI_SCOPES.LAST_20,
+  ],
+  VIEWER: [ASK_AI_SCOPES.MESSAGE_ONLY],
+};
+
+const SCOPE_MESSAGE_LIMITS = {
+  [ASK_AI_SCOPES.MESSAGE_ONLY]: 0,
+  [ASK_AI_SCOPES.LAST_5]: 5,
+  [ASK_AI_SCOPES.LAST_20]: 20,
+  [ASK_AI_SCOPES.ENTIRE_CHAT]: 20,
+};
+
+export function getAllowedAiScopesForRole(role) {
+  const normalizedRole = String(role || "VIEWER").toUpperCase();
+  return ROLE_SCOPE_POLICY[normalizedRole] || ROLE_SCOPE_POLICY.VIEWER;
+}
+
+export function resolveScopeForRole(requestedScope, role) {
+  const allowedScopes = getAllowedAiScopesForRole(role);
+  return allowedScopes.includes(requestedScope)
+    ? requestedScope
+    : allowedScopes[0];
+}
+
+export function limitHistoryByScope(history, scope) {
+  const safeHistory = Array.isArray(history) ? history : [];
+  const maxItems = SCOPE_MESSAGE_LIMITS[scope] ?? 0;
+
+  if (maxItems <= 0) {
+    return [];
+  }
+
+  return safeHistory.slice(-maxItems);
+}
+
 /**
  * Very simple privacy filter – masks obvious emails, phone-like strings,
  * and very long tokens / keys.
@@ -54,20 +112,10 @@ function buildAskAIHistory({
   const idx = messages.findIndex((m) => m.id === targetMessageId);
   const upperIndex = idx === -1 ? messages.length : idx; // up to (not incl.) target
 
-  let limitCount;
-  switch (s) {
-    case ASK_AI_SCOPES.LAST_5:
-      limitCount = 5;
-      break;
-    case ASK_AI_SCOPES.LAST_20:
-      limitCount = 20;
-      break;
-    case ASK_AI_SCOPES.ENTIRE_CHAT:
-      limitCount = messages.length; // clamp by chars below
-      break;
-    default:
-      limitCount = 0;
-  }
+  const limitCount =
+    s === ASK_AI_SCOPES.ENTIRE_CHAT
+      ? messages.length
+      : SCOPE_MESSAGE_LIMITS[s] ?? 0;
 
   if (limitCount <= 0) return [];
 

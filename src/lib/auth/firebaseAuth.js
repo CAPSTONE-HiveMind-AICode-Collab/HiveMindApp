@@ -9,7 +9,7 @@ import { doc, setDoc, getDoc } from "firebase/firestore";
 export function listenToAuthChanges(callback) {
   return onAuthStateChanged(auth, async (firebaseUser) => {
     if (firebaseUser) {
-      const { uid, displayName, email } = firebaseUser;
+      const { uid, displayName, email, photoURL } = firebaseUser;
 
       console.info("[auth] onAuthStateChanged - signed in:", { uid, email });
 
@@ -18,21 +18,23 @@ export function listenToAuthChanges(callback) {
         const userRef = doc(db, "Users", uid);
         const userSnap = await getDoc(userRef);
 
-        // If user does not exist, create it
-        if (!userSnap.exists()) {
-          await setDoc(userRef, {
+        await setDoc(
+          userRef,
+          {
             uid,
             displayName: displayName || "",
             email: email || "",
-            createdAt: new Date(),
-          });
-        }
+            photoURL: photoURL || "",
+            ...(userSnap.exists() ? {} : { createdAt: new Date() }),
+          },
+          { merge: true }
+        );
 
         // Pass user info to callback
-        callback({ uid, displayName, email });
+        callback({ uid, displayName, email, photoURL });
       } catch (err) {
         console.error("Error adding user to Firestore:", err);
-        callback({ uid, displayName, email }); // still pass user info
+        callback({ uid, displayName, email, photoURL }); // still pass user info
       }
     } else {
       callback(null);

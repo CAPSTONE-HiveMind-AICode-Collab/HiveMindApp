@@ -1,25 +1,31 @@
 // src/app/api/ai/route.js
 import { NextResponse } from "next/server";
 import { GoogleGenAI } from "@google/genai";
+import {
+  adminAuth,
+  adminDb,
+  isFirebaseAdminConfigured,
+} from "@/lib/firebase/firebaseAdmin";
+import {
+  limitHistoryByScope,
+  resolveScopeForRole,
+} from "@/lib/business/contextBuilderService";
+import { extractJsonObject } from "@/lib/ai/structuredOutput";
 
 export const runtime = "nodejs";
 
-// Attempt to extract useful details from Gemini SDK errors
+const ALLOWED_GEMINI_MODELS = new Set([
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-pro",
+]);
+
+const ALLOWED_PROVIDERS = new Set(["gemini", "anthropic"]);
+const DEFAULT_ROLE = "VIEWER";
+
 function extractGeminiError(err) {
   const rawMessage = String(err?.message || "");
-  let parsed = null;
-
-  try {
-    parsed = JSON.parse(rawMessage);
-  } catch {
-    const start = rawMessage.indexOf("{");
-    const end = rawMessage.lastIndexOf("}");
-    if (start >= 0 && end >= 0 && end > start) {
-      try {
-        parsed = JSON.parse(rawMessage.slice(start, end + 1));
-      } catch {}
-    }
-  }
+  const parsed = extractJsonObject(rawMessage);
 
   const apiErr = parsed?.error || null;
   return {
@@ -31,21 +37,17 @@ function extractGeminiError(err) {
   };
 }
 
-function isQuotaError(e) {
+function isQuotaError(error) {
   return (
-    e?.code === 429 ||
-    e?.status === "RESOURCE_EXHAUSTED" ||
-    String(e?.message || "").includes("429") ||
-    /quota|Too Many Requests|RESOURCE_EXHAUSTED/i.test(String(e?.message || ""))
+    error?.code === 429 ||
+    error?.status === "RESOURCE_EXHAUSTED" ||
+    error?.status === "rate_limit_error" ||
+    String(error?.message || "").includes("429") ||
+    /quota|Too Many Requests|RESOURCE_EXHAUSTED|rate limit/i.test(
+      String(error?.message || "")
+    )
   );
 }
-
-//  only allow models your UI supports
-const ALLOWED_MODELS = new Set([
-  "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-2.5-pro",
-]);
 
 function normalizeModelName(input) {
   const raw = String(input || "").trim();
@@ -53,116 +55,296 @@ function normalizeModelName(input) {
   return raw.replace(/^models\//, "");
 }
 
+function sanitizeProvider(rawProvider) {
+  const value = String(rawProvider || "").trim().toLowerCase();
+  return ALLOWED_PROVIDERS.has(value) ? value : "gemini";
+}
+
 function sanitizeHistory(history) {
   if (!Array.isArray(history)) return [];
 
-  // expect: { role: "user"|"model", parts: [{ text: "..." }] }
   return history
-    .filter((h) => h && typeof h === "object")
-    .map((h) => {
-      const role = h.role === "model" ? "model" : "user";
-      const parts = Array.isArray(h.parts) ? h.parts : [];
+    .filter((item) => item && typeof item === "object")
+    .map((item) => {
+      const role = item.role === "model" ? "model" : "user";
+      const parts = Array.isArray(item.parts) ? item.parts : [];
       const cleanParts = parts
-        .map((p) => ({ text: String(p?.text ?? "") }))
-        .filter((p) => p.text.trim().length > 0);
+        .map((part) => ({ text: String(part?.text ?? "") }))
+        .filter((part) => part.text.trim().length > 0);
 
       return { role, parts: cleanParts };
     })
-    .filter((h) => h.parts.length > 0)
-    .slice(-20); // keep last N turns only (avoid huge prompts)
+    .filter((item) => item.parts.length > 0)
+    .slice(-20);
+}
+
+function getBearerToken(req) {
+  const header = req.headers.get("authorization") || "";
+  return header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+}
+
+function sanitizeContext(rawContext) {
+  const context =
+    rawContext && typeof rawContext === "object" ? rawContext : {};
+
+  return {
+    hiveID: typeof context.hiveID === "string" ? context.hiveID.trim() : "",
+    honeycombID:
+      typeof context.honeycombID === "string"
+        ? context.honeycombID.trim()
+        : "",
+    scope: typeof context.scope === "string" ? context.scope.trim() : "",
+    feature: typeof context.feature === "string" ? context.feature.trim() : "",
+  };
+}
+
+function jsonError(message, status, extra = {}) {
+  return NextResponse.json({ error: message, ...extra }, { status });
+}
+
+function normalizeAnthropicMessages(history, message) {
+  const mappedHistory = history.map((item) => ({
+    role: item.role === "model" ? "assistant" : "user",
+    content: item.parts.map((part) => part.text).join("\n\n"),
+  }));
+
+  return [...mappedHistory, { role: "user", content: message }];
+}
+
+async function authenticateRequest(req, context) {
+  if (!isFirebaseAdminConfigured || !adminAuth) {
+    return {
+      error: jsonError(
+        "Firebase Admin SDK is not configured. Add FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY to secure AI routes.",
+        500
+      ),
+    };
+  }
+
+  const token = getBearerToken(req);
+  if (!token) {
+    return { error: jsonError("Authentication required.", 401) };
+  }
+
+  let decodedToken;
+  try {
+    decodedToken = await adminAuth.verifyIdToken(token);
+  } catch (error) {
+    console.error("AI route token verification failed:", error);
+    return { error: jsonError("Invalid or expired token.", 401) };
+  }
+
+  let role = DEFAULT_ROLE;
+  let effectiveScope = context.scope || "";
+
+  if (context.hiveID) {
+    if (!adminDb) {
+      return { error: jsonError("Admin database is not configured.", 500) };
+    }
+
+    const memberRef = adminDb
+      .collection("Hive")
+      .doc(context.hiveID)
+      .collection("members")
+      .doc(decodedToken.uid);
+    const memberSnap = await memberRef.get();
+
+    if (!memberSnap.exists) {
+      return {
+        error: jsonError("You do not have access to this hive.", 403),
+      };
+    }
+
+    role = String(memberSnap.data()?.role || DEFAULT_ROLE).toUpperCase();
+    effectiveScope = context.scope
+      ? resolveScopeForRole(context.scope, role)
+      : "";
+
+    if (context.feature === "chat_reply" && role === DEFAULT_ROLE) {
+      return {
+        error: jsonError(
+          "Your role does not allow AI chat replies in this hive.",
+          403
+        ),
+      };
+    }
+  }
+
+  return {
+    auth: {
+      uid: decodedToken.uid,
+      role,
+      effectiveScope,
+    },
+  };
 }
 
 export async function POST(req) {
   const payload = await req.json().catch(() => ({}));
-
   const message =
     typeof payload?.message === "string" ? payload.message.trim() : "";
   const requestedModel = payload?.model;
+  const requestedProvider = sanitizeProvider(payload?.provider);
+  const context = sanitizeContext(payload?.context);
 
-  // history from client (optional)
-  const history = sanitizeHistory(payload?.history);
-
-  if (!message) {
-    return NextResponse.json({ reply: "No message provided" }, { status: 400 });
+  const authResult = await authenticateRequest(req, context);
+  if (authResult.error) {
+    return authResult.error;
   }
 
-  // Prefer GEMINI_API_KEY; fall back to GENAI_API_KEY
-  const apiKey = process.env.GEMINI_API_KEY || process.env.GENAI_API_KEY || "";
+  const requestedHistory = sanitizeHistory(payload?.history);
+  const history = context.scope
+    ? limitHistoryByScope(requestedHistory, authResult.auth.effectiveScope)
+    : requestedHistory;
 
-  // Demo mode support
+  if (!message) {
+    return jsonError("No message provided", 400);
+  }
+
+  const geminiApiKey = process.env.GEMINI_API_KEY || process.env.GENAI_API_KEY || "";
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY || "";
   const demoEnv =
     process.env.NEXT_PUBLIC_AI_DEMO === "true" ||
     process.env.AI_DEMO === "1" ||
     process.env.AI_DEMO === "true";
 
-  //  model routing (allowlist + default)
-  const envModel = process.env.GENAI_MODEL || process.env.GEMINI_MODEL || "";
-  const candidate = normalizeModelName(requestedModel || envModel);
-
-  const modelName = ALLOWED_MODELS.has(candidate)
-    ? candidate
+  const envGeminiModel = process.env.GENAI_MODEL || process.env.GEMINI_MODEL || "";
+  const geminiCandidate = normalizeModelName(requestedModel || envGeminiModel);
+  const geminiModel = ALLOWED_GEMINI_MODELS.has(geminiCandidate)
+    ? geminiCandidate
     : "gemini-2.5-flash";
 
-  // 1) Primary: Gemini via @google/genai if api key exists
-  if (apiKey) {
-    try {
-      const ai = new GoogleGenAI({ apiKey });
+  const anthropicModel =
+    normalizeModelName(requestedModel) ||
+    process.env.ANTHROPIC_MODEL ||
+    "claude-3-5-sonnet-latest";
 
+  if (requestedProvider === "anthropic" && anthropicApiKey) {
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": anthropicApiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: anthropicModel,
+          max_tokens: 700,
+          messages: normalizeAnthropicMessages(history, message),
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+      const reply = Array.isArray(data?.content)
+        ? data.content
+            .filter((part) => part?.type === "text")
+            .map((part) => String(part?.text || ""))
+            .join("\n\n")
+            .trim()
+        : "";
+
+      if (response.status === 429) {
+        return NextResponse.json(
+          {
+            error: {
+              code: 429,
+              status: "rate_limit_error",
+              message:
+                data?.error?.message ||
+                "You exceeded your current Claude quota. Shorten prompts or reduce frequency.",
+            },
+            provider: "anthropic",
+            model: anthropicModel,
+          },
+          { status: 429 }
+        );
+      }
+
+      if (response.ok && reply) {
+        return NextResponse.json({
+          reply,
+          provider: "anthropic",
+          model: anthropicModel,
+          role: authResult.auth.role,
+          effectiveScope: authResult.auth.effectiveScope || null,
+        });
+      }
+
+      console.error("Anthropic provider error:", data);
+    } catch (error) {
+      console.error("Anthropic request failed:", error);
+    }
+  }
+
+  if (geminiApiKey) {
+    try {
+      const ai = new GoogleGenAI({ apiKey: geminiApiKey });
       const contents =
         history.length > 0
-          ? [
-              ...history,
-              { role: "user", parts: [{ text: message }] },
-            ]
+          ? [...history, { role: "user", parts: [{ text: message }] }]
           : [{ role: "user", parts: [{ text: message }] }];
 
       const result = await ai.models.generateContent({
-        model: modelName,
+        model: geminiModel,
         contents,
       });
 
-      const reply = result?.text || "Sorry, I couldn’t generate a response.";
-      return NextResponse.json({ reply, provider: "genai", model: modelName });
-    } catch (err) {
-      const e = extractGeminiError(err);
+      const reply = result?.text || "Sorry, I couldn't generate a response.";
+      return NextResponse.json({
+        reply,
+        provider: "genai",
+        model: geminiModel,
+        role: authResult.auth.role,
+        effectiveScope: authResult.auth.effectiveScope || null,
+      });
+    } catch (error) {
+      const details = extractGeminiError(error);
 
-      if (isQuotaError(e)) {
+      if (isQuotaError(details)) {
         return NextResponse.json(
           {
             error: {
               code: 429,
               status: "RESOURCE_EXHAUSTED",
               message:
-                e?.message ||
-                "You exceeded your current quota. Shorten prompts / reduce frequency / check plan.",
+                details?.message ||
+                "You exceeded your current quota. Shorten prompts or reduce frequency.",
             },
             provider: "genai",
-            model: modelName,
+            model: geminiModel,
           },
           { status: 429 }
         );
       }
 
-      console.error("GenAI (GoogleGenAI) error:", err);
+      console.error("GenAI (GoogleGenAI) error:", error);
     }
   }
 
-  // 2) Demo fallback
   if (demoEnv) {
     return NextResponse.json({
-      reply: `Demo AI: ${message}`,
+      reply:
+        requestedProvider === "anthropic"
+          ? `Demo Claude: ${message}`
+          : `Demo AI: ${message}`,
       demo: true,
-      provider: "demo",
-      model: modelName,
+      provider: requestedProvider === "anthropic" ? "anthropic-demo" : "demo",
+      model: requestedProvider === "anthropic" ? anthropicModel : geminiModel,
+      role: authResult.auth.role,
+      effectiveScope: authResult.auth.effectiveScope || null,
     });
   }
 
-  // 3) Firebase model fallback
   try {
     const mod = await import("@/lib/firebase/config");
     const firebaseModel = mod?.model;
 
-    if (firebaseModel && typeof firebaseModel.generateContent === "function") {
+    if (
+      requestedProvider !== "anthropic" &&
+      firebaseModel &&
+      typeof firebaseModel.generateContent === "function"
+    ) {
       const result = await firebaseModel.generateContent(message);
       const response = await result.response;
       const reply =
@@ -170,25 +352,34 @@ export async function POST(req) {
           ? response.text()
           : result?.text || "AI did not respond.";
 
-      return NextResponse.json({ reply, provider: "firebase", model: modelName });
+      return NextResponse.json({
+        reply,
+        provider: "firebase",
+        model: geminiModel,
+        role: authResult.auth.role,
+        effectiveScope: authResult.auth.effectiveScope || null,
+      });
     }
-  } catch (e) {
-    console.warn("Firebase model fallback not available:", e?.message || e);
+  } catch (error) {
+    console.warn("Firebase model fallback not available:", error?.message || error);
   }
 
-  // 4) No provider configured
-  if (!apiKey) {
-    return NextResponse.json(
-      {
-        error:
-          "No AI API key configured. Set GEMINI_API_KEY (recommended) or GENAI_API_KEY in .env.local.",
-      },
-      { status: 500 }
+  if (!geminiApiKey && requestedProvider !== "anthropic") {
+    return jsonError(
+      "No AI API key configured. Set GEMINI_API_KEY or GENAI_API_KEY in .env.local.",
+      500
     );
   }
 
-  return NextResponse.json(
-    { error: "AI provider failed and no fallback provider is configured." },
-    { status: 500 }
+  if (!anthropicApiKey && requestedProvider === "anthropic") {
+    return jsonError(
+      "Anthropic provider requested but ANTHROPIC_API_KEY is not configured.",
+      500
+    );
+  }
+
+  return jsonError(
+    "AI provider failed and no fallback provider is configured.",
+    500
   );
 }

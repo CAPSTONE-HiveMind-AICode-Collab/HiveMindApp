@@ -5,6 +5,10 @@ export const KnowledgeService = {
   async askHive(hiveId, userQuestion, tags = []) {
     // 1. Fetch relevant Nectar entries based on tags
     const contextEntries = await NectarRepository.searchByTags(hiveId, tags);
+
+    if (!contextEntries.length) {
+      return "I don't have that information in my memory yet.";
+    }
     
     // 2. Build the RAG Prompt
     const contextString = contextEntries

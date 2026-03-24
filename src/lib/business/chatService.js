@@ -20,6 +20,9 @@ import { callGeminiAPI } from "@/lib/data/aiRepository";
 import { updateThreadStatus, getThreadParticipants } from "@/lib/data/firestoreRepository";
 import { scheduleTimeBasedNotification, notifyUsers } from "@/lib/business/notificationService";
 import { generateAndStoreThreadSummary } from "@/lib/data/summaryRepository";
+import { generateAndStoreDecisionRecordForThread } from "@/lib/data/decisionRepository";
+import { touchHiveLastActive } from "@/lib/data/hiveRepository";
+import { NectarRepository } from "@/lib/data/nectarRepository";
 import { isToxicMessage, getToxicityDetails } from "@/lib/business/ToxicityService";
 /* ----------------- Notifications -----------------*/
 
@@ -76,7 +79,6 @@ export function useSendUserMessage() {
         return;
       }
     }
-    }
 
     //  allow “attachments-only” messages
     if (!cleanedText && !hasAttachments) return;
@@ -122,6 +124,8 @@ export function useSendUserMessage() {
           )
         )
     );
+
+    await touchHiveLastActive(hiveID);
 
     return msgRef.id;
   };
@@ -300,6 +304,8 @@ export function useSendThreadMessage() {
       timestamp: serverTimestamp(),
       parentMessageId: parentMessageID,
     });
+
+    await touchHiveLastActive(hiveID);
   };
 
   return sendThreadMessage;
@@ -352,6 +358,7 @@ export async function sendAIReply(text, hiveID, honeycombID) {
       senderId: "AI",
       timestamp: serverTimestamp(),
     });
+    await touchHiveLastActive(hid);
   } catch (error) {
     console.error("Failed to send AI reply:", error);
 
@@ -362,6 +369,7 @@ export async function sendAIReply(text, hiveID, honeycombID) {
       senderId: "AI",
       timestamp: serverTimestamp(),
     });
+    await touchHiveLastActive(hid);
   }
 }
 
@@ -521,24 +529,43 @@ export async function closeThreadAndNotify(hiveID, honeycombID, parentMessageID,
       .filter(Boolean)
       .map(String);
 
-    if (userIDs.length === 0) return;
 
     const message = `Thread "${tid}" was closed by ${closedByUser?.displayName || "a user"}.`;
 
-    await notifyUsers(userIDs, {
+    if (userIDs.length > 0) {
+      await notifyUsers(userIDs, {
       type: "THREAD_CLOSED",
       hiveID: hid,
       honeycombID: cid,
       threadID: tid,
       message,
       notifyAt: null,
-    });
+      });
+
+      console.log("THREAD_CLOSED notifications sent to:", userIDs);
+    }
 
     console.log(`✅ THREAD_CLOSED notifications sent to:`, userIDs);
 
     // 4️⃣ Generate and store AI summary for this completed thread
     try {
-      await generateAndStoreThreadSummary(
+      await generateAndStoreDecisionRecordForThread({
+        hiveID,
+        honeycombID,
+        parentMessageID,
+        threadID,
+        closedByUser,
+        summaryText: "",
+      });
+      console.log("Decision record generated and stored for thread:", threadID);
+    } catch (err) {
+      console.error("Failed to generate decision record for thread:", err);
+    }
+
+    let summaryText = "";
+
+    try {
+      summaryText = await generateAndStoreThreadSummary(
         hiveID,
         honeycombID,
         parentMessageID,

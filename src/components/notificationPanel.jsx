@@ -10,7 +10,7 @@ import {
   approveJoinRequest,
   denyJoinRequest,
 } from "@/lib/business/notificationService";
-import { deleteNotification } from "@/lib/data/firestoreRepository"; // Make sure this exists
+import { deleteNotification } from "@/lib/data/firestoreRepository";
 
 export default function NotificationsPanel() {
   const { user } = useUser();
@@ -46,11 +46,11 @@ export default function NotificationsPanel() {
 
     const unsubscribe = listenToNotifications(user.uid, (allNotifs) => {
       const now = new Date();
-      const visibleNotifs = allNotifs.filter((n) => {
-        if (n.type === "THREAD_CLOSED") return true;
-        if (n.type !== "TIME_BASED") return true;
-        if (!n.notifyAt) return true;
-        const notifyAtDate = normalizeNotifyAt(n.notifyAt);
+      const visibleNotifs = allNotifs.filter((notif) => {
+        if (notif.type === "THREAD_CLOSED") return true;
+        if (notif.type !== "TIME_BASED") return true;
+        if (!notif.notifyAt) return true;
+        const notifyAtDate = normalizeNotifyAt(notif.notifyAt);
         return notifyAtDate <= now;
       });
 
@@ -66,8 +66,8 @@ export default function NotificationsPanel() {
       if (dueNotifs.length > 0) {
         setNotifications((prev) => {
           const merged = [...prev];
-          for (const n of dueNotifs) {
-            if (!merged.some((m) => m.id === n.id)) merged.unshift(n);
+          for (const notif of dueNotifs) {
+            if (!merged.some((existing) => existing.id === notif.id)) merged.unshift(notif);
           }
           return merged.sort(
             (a, b) => normalizeTimestamp(b.timestamp) - normalizeTimestamp(a.timestamp)
@@ -92,7 +92,7 @@ export default function NotificationsPanel() {
   const handleNotificationClick = async (notif) => {
     await markNotificationRead(user.uid, notif.id);
     setNotifications((prev) =>
-      prev.map((n) => (n.id === notif.id ? { ...n, read: true } : n))
+      prev.map((item) => (item.id === notif.id ? { ...item, read: true } : item))
     );
 
     if (notif.type === "THREAD_CLOSED") {
@@ -105,8 +105,8 @@ export default function NotificationsPanel() {
 
   const handleDeleteNotification = async (notifID) => {
     try {
-      await deleteNotification(user.uid, notifID); // remove from Firestore
-      setNotifications((prev) => prev.filter((n) => n.id !== notifID)); // remove from UI
+      await deleteNotification(user.uid, notifID);
+      setNotifications((prev) => prev.filter((item) => item.id !== notifID));
     } catch (err) {
       console.error("Failed to delete notification:", err);
     }
@@ -127,8 +127,8 @@ export default function NotificationsPanel() {
         role
       );
       setNotifications((prev) =>
-        prev.map((n) =>
-          n.id === notif.id ? { ...n, status: "approved", read: true } : n
+        prev.map((item) =>
+          item.id === notif.id ? { ...item, status: "approved", read: true } : item
         )
       );
     } catch (err) {
@@ -151,8 +151,8 @@ export default function NotificationsPanel() {
         notif.hiveID
       );
       setNotifications((prev) =>
-        prev.map((n) =>
-          n.id === notif.id ? { ...n, status: "denied", read: true } : n
+        prev.map((item) =>
+          item.id === notif.id ? { ...item, status: "denied", read: true } : item
         )
       );
     } catch (err) {
@@ -163,114 +163,123 @@ export default function NotificationsPanel() {
     }
   };
 
-  const unreadCount = notifications.filter((n) => !n.read).length;
+  const unreadCount = notifications.filter((item) => !item.read).length;
 
   return (
-    <div className="fixed top-20 right-4 z-[99999]">
+    <div className="notification-float fixed right-4 top-20 z-[99999]">
       <button
-        className="p-4 bg-gradient-to-r from-blue-500 to-blue-600 rounded-full shadow-2xl hover:from-blue-600 hover:to-blue-700 relative border-2 border-blue-300 transition-all transform hover:scale-110"
+        className="relative rounded-full border border-cyan-300/30 bg-slate-950/70 p-4 shadow-2xl shadow-slate-950/35 transition-all hover:scale-105 hover:border-cyan-200/50 hover:bg-slate-900/85"
         onClick={togglePanel}
+        type="button"
       >
-        <span className="text-2xl">🔔</span>
-        {unreadCount > 0 && (
-          <span className="absolute -top-2 -right-2 bg-red-600 text-white rounded-full text-sm w-8 h-8 flex items-center justify-center animate-pulse font-bold shadow-lg border-2 border-white">
+        <span className="text-2xl font-semibold text-cyan-100">N</span>
+        {unreadCount > 0 ? (
+          <span className="absolute -right-2 -top-2 flex h-8 w-8 items-center justify-center rounded-full border-2 border-slate-950 bg-rose-500 text-sm font-bold text-white shadow-lg">
             {unreadCount}
           </span>
-        )}
+        ) : null}
       </button>
 
-      {panelOpen && (
-        <div 
-          className="mt-3 w-[420px] max-h-[650px] overflow-y-auto bg-white border-2 border-gray-400 shadow-2xl rounded-xl z-[99999]" 
-          style={{ maxHeight: '650px' }}
+      {panelOpen ? (
+        <div
+          className="z-[99999] mt-3 max-h-[650px] w-[420px] overflow-y-auto rounded-2xl border border-white/10 bg-slate-950/90 shadow-2xl"
+          style={{ maxHeight: "650px" }}
         >
-          <div className="flex justify-between items-center p-4 border-b-2 border-gray-300 bg-gradient-to-r from-blue-50 to-blue-100 sticky top-0 z-10">
-            <h3 className="font-bold text-xl text-gray-900">🔔 Notifications</h3>
+          <div className="sticky top-0 z-10 flex items-center justify-between border-b border-white/10 bg-slate-950/95 p-4">
+            <h3 className="text-xl font-bold text-white">Notifications</h3>
             <button
-              className="text-gray-600 hover:text-gray-900 text-2xl font-bold hover:bg-gray-200 rounded-full w-8 h-8 flex items-center justify-center transition-all"
+              className="flex h-8 w-8 items-center justify-center rounded-full text-2xl font-bold text-slate-400 transition-all hover:bg-white/10 hover:text-white"
               onClick={closePanel}
+              type="button"
             >
-              ✖
+              x
             </button>
           </div>
 
           {notifications.length === 0 ? (
-            <p className="p-6 text-gray-500 text-base text-center">No notifications</p>
+            <p className="p-6 text-center text-base text-slate-400">No notifications</p>
           ) : (
             <ul>
               {notifications.map((notif) => (
                 <li
                   key={notif.id}
-                  className={`p-4 border-b border-gray-200 hover:bg-blue-50 transition-colors ${
-                    notif.read ? "opacity-60 bg-gray-50" : "font-semibold bg-white"
+                  className={`border-b border-white/8 p-4 transition-colors ${
+                    notif.read ? "bg-slate-950/30 opacity-70" : "bg-white/5 font-semibold"
                   }`}
                 >
                   {notif.type === "JOIN_REQUEST" && notif.status === "pending" ? (
                     <div className="space-y-3">
                       <div>
-                        <p className="text-base text-gray-900">{notif.message}</p>
-                        <small className="text-gray-500 text-xs">
+                        <p className="text-base text-white">{notif.message}</p>
+                        <small className="text-xs text-slate-400">
                           {normalizeTimestamp(notif.timestamp).toLocaleString()} {" • "}
-                          <span className="uppercase text-[11px] font-bold text-blue-600">{notif.type}</span>
+                          <span className="text-[11px] font-bold uppercase text-cyan-100">
+                            {notif.type}
+                          </span>
                         </small>
                       </div>
 
                       <div className="flex items-center gap-2">
                         <select
                           value={selectedRole[notif.id] || "MEMBER"}
-                          onChange={(e) =>
+                          onChange={(event) =>
                             setSelectedRole((prev) => ({
                               ...prev,
-                              [notif.id]: e.target.value,
+                              [notif.id]: event.target.value,
                             }))
                           }
-                          className="text-sm border-2 border-gray-300 rounded-lg px-3 py-2 font-medium focus:border-blue-500 focus:ring-2 focus:ring-blue-200"
+                          className="select-shell text-sm"
                           disabled={processing[notif.id]}
                         >
-                          <option value="VIEWER">👁️ VIEWER</option>
-                          <option value="MEMBER">👤 MEMBER</option>
-                          <option value="ADMIN">⚡ ADMIN</option>
+                          <option value="VIEWER">VIEWER</option>
+                          <option value="MEMBER">MEMBER</option>
+                          <option value="ADMIN">ADMIN</option>
                         </select>
 
                         <button
                           onClick={() => handleApproveJoinRequest(notif)}
                           disabled={processing[notif.id]}
-                          className="text-sm bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 disabled:bg-gray-400 font-semibold shadow-md transition-all"
+                          className="button-primary text-sm"
+                          type="button"
                         >
-                          ✓ Approve
+                          Approve
                         </button>
 
                         <button
                           onClick={() => handleDenyJoinRequest(notif)}
                           disabled={processing[notif.id]}
-                          className="text-sm bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 disabled:bg-gray-400 font-semibold shadow-md transition-all"
+                          className="button-danger text-sm"
+                          type="button"
                         >
-                          ✗ Deny
+                          Deny
                         </button>
                       </div>
                     </div>
                   ) : (
-                    <div className="flex justify-between items-center cursor-pointer hover:bg-blue-100 transition p-2 rounded-lg">
+                    <div className="flex items-center justify-between rounded-xl p-2 transition hover:bg-white/6">
                       <div
-                        className="flex-1"
+                        className="flex-1 cursor-pointer"
                         onClick={() => handleNotificationClick(notif)}
                       >
-                        <p className="text-base text-gray-900">{notif.message}</p>
-                        <small className="text-gray-500 text-xs">
+                        <p className="text-base text-white">{notif.message}</p>
+                        <small className="text-xs text-slate-400">
                           {normalizeTimestamp(notif.timestamp).toLocaleString()} {" • "}
-                          <span className="uppercase text-[11px] font-bold text-blue-600">{notif.type}</span>
-                          {notif.status && notif.status !== "pending" && (
-                            <span className="ml-1 text-[11px] text-gray-600 font-semibold">
+                          <span className="text-[11px] font-bold uppercase text-cyan-100">
+                            {notif.type}
+                          </span>
+                          {notif.status && notif.status !== "pending" ? (
+                            <span className="ml-1 text-[11px] font-semibold text-slate-300">
                               ({notif.status})
                             </span>
-                          )}
+                          ) : null}
                         </small>
                       </div>
                       <button
-                        className="ml-3 text-red-600 text-lg hover:text-red-800 hover:bg-red-100 rounded-full w-8 h-8 flex items-center justify-center transition-all font-bold"
+                        className="ml-3 flex h-8 w-8 items-center justify-center rounded-full text-lg font-bold text-rose-200 transition-all hover:bg-rose-500/10 hover:text-rose-100"
                         onClick={() => handleDeleteNotification(notif.id)}
+                        type="button"
                       >
-                        ✖
+                        x
                       </button>
                     </div>
                   )}
@@ -279,7 +288,7 @@ export default function NotificationsPanel() {
             </ul>
           )}
         </div>
-      )}
+      ) : null}
 
       <audio ref={audioRef} src="/notification.mp3" preload="auto" />
     </div>
