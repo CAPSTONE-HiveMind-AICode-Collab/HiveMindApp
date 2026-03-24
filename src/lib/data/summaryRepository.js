@@ -58,7 +58,7 @@ export async function generateAndStoreThreadSummary(
   const messages = threadSnap.docs.map((d) => d.data());
 
   if (messages.length === 0 && !parentText) {
-    return; // nothing to summarize
+    return ""; // nothing to summarize
   }
 
   const joined = [
@@ -144,6 +144,8 @@ ${joined}
     closedByUserId: closedByUser?.uid || null,
     closedByUserName: closedByUser?.displayName || null,
   });
+
+  return aiText;
 }
 
 /**
