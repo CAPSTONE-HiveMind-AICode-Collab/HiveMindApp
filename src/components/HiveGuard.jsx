@@ -3,62 +3,97 @@
 import { useState, useEffect } from "react";
 import { useUser } from "@/lib/auth/userContext";
 import { db } from "@/lib/firebase/config";
-import { collection, addDoc, serverTimestamp, onSnapshot, deleteDoc, doc } from "firebase/firestore";
+import { 
+  collection, 
+  addDoc, 
+  serverTimestamp, 
+  onSnapshot, 
+  deleteDoc, 
+  doc 
+} from "firebase/firestore";
+import { listHiveMembers } from "@/lib/data/roleRepository";
+// NEW: Encryption Imports
+import AES from "crypto-js/aes";
+import Utf8 from "crypto-js/enc-utf8";
+
+// Master Key from Environment Variables
+const MASTER_KEY = process.env.NEXT_PUBLIC_MASTER_HIVE_KEY || "hivemind-default-safety-key";
 
 export default function HiveGuard({ hiveID, currentUserRole }) {
   const { user } = useUser();
   const [secrets, setSecrets] = useState([]);
+  const [members, setMembers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [revealedSecrets, setRevealedSecrets] = useState({});
   const [copiedId, setCopiedId] = useState(null);
+  
+  // Form State
   const [keyName, setKeyName] = useState("");
   const [secretValue, setSecretValue] = useState("");
-  const [visibleTo, setVisibleTo] = useState(["ADMIN", "OWNER"]);
+  const [visibleTo, setVisibleTo] = useState(["ADMIN", "OWNER"]); 
   const [isProcessing, setIsProcessing] = useState(false);
 
+  // NEW: Decryption Helper Function
+  const decryptSecret = (cipherText) => {
+    try {
+      const bytes = AES.decrypt(cipherText, MASTER_KEY);
+      const originalText = bytes.toString(Utf8);
+      if (!originalText) throw new Error("Decryption returned empty string");
+      return originalText;
+    } catch (error) {
+      console.error("Decryption failed:", error);
+      return "DECRYPTION_ERROR";
+    }
+  };
+
+  // Load Secrets & Members
   useEffect(() => {
     if (!hiveID) return;
 
     const secretsRef = collection(db, "Hive", hiveID, "secrets");
-    const unsubscribe = onSnapshot(secretsRef, (snapshot) => {
-      const docs = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-      const filtered = docs.filter(
-        (secret) => secret.visibleTo.includes(currentUserRole) || currentUserRole === "OWNER"
-      );
+    const unsubSecrets = onSnapshot(secretsRef, (snapshot) => {
+      const docs = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      const filtered = docs.filter(s => s.visibleTo.includes(currentUserRole) || currentUserRole === "OWNER");
       setSecrets(filtered);
       setLoading(false);
     });
 
-    return () => unsubscribe();
+    listHiveMembers(hiveID).then(setMembers);
+
+    return () => unsubSecrets();
   }, [hiveID, currentUserRole]);
 
-  const handleSaveSecret = async (event) => {
-    event.preventDefault();
+  const handleSaveSecret = async (e) => {
+    e.preventDefault();
     if (!keyName || !secretValue) return;
     setIsProcessing(true);
 
     try {
+      // NEW: Encrypt the secret value before sending to Firestore
+      const encryptedValue = AES.encrypt(secretValue, MASTER_KEY).toString();
+
       const secretsRef = collection(db, "Hive", hiveID, "secrets");
       await addDoc(secretsRef, {
         keyName: keyName.toUpperCase(),
-        value: secretValue,
-        visibleTo,
+        value: encryptedValue, // Storing cipher text
+        visibleTo: visibleTo,
         createdBy: user.uid,
         createdAt: serverTimestamp(),
       });
 
+      // Audit Log
       await addDoc(collection(db, "auditLogs"), {
         event: "SECRET_CREATED",
         hiveId: hiveID,
         userId: user.uid,
-        details: `Created secret: ${keyName.toUpperCase()}`,
+        details: `Created encrypted secret: ${keyName.toUpperCase()}`,
         timestamp: serverTimestamp(),
       });
 
       setKeyName("");
       setSecretValue("");
     } catch (error) {
-      alert(`Security error: ${error.message}`);
+      alert("Security Error: " + error.message);
     } finally {
       setIsProcessing(false);
     }
@@ -69,178 +104,166 @@ export default function HiveGuard({ hiveID, currentUserRole }) {
     await deleteDoc(doc(db, "Hive", hiveID, "secrets", id));
   };
 
-  const copySecret = async (secret) => {
-    const textToCopy = secret.value;
-    const fallbackCopy = (text) => {
-      const textArea = document.createElement("textarea");
-      textArea.value = text;
-      document.body.appendChild(textArea);
-      textArea.select();
-      try {
-        document.execCommand("copy");
-        return true;
-      } catch {
-        return false;
-      } finally {
-        document.body.removeChild(textArea);
-      }
-    };
-
-    let success = false;
-    if (navigator.clipboard && window.isSecureContext) {
-      try {
-        await navigator.clipboard.writeText(textToCopy);
-        success = true;
-      } catch {
-        success = fallbackCopy(textToCopy);
-      }
-    } else {
-      success = fallbackCopy(textToCopy);
-    }
-
-    if (success) {
-      setCopiedId(secret.id);
-      setTimeout(() => setCopiedId(null), 2000);
-    }
-  };
-
-  if (loading) {
-    return (
-      <div className="glass-panel text-center">
-        <div className="mx-auto h-8 w-8 animate-spin rounded-full border-b-2 border-cyan-200" />
-        <p className="mt-3 text-sm text-slate-300">Scanning vault...</p>
-      </div>
-    );
-  }
+  if (loading) return <div className="p-8 text-center animate-pulse">Scanning Shield...</div>;
 
   return (
-    <div className="space-y-6">
-      <div className="hero-panel">
-        <span className="hero-chip">HiveGuard</span>
-        <h2 className="mt-5 text-3xl font-semibold tracking-[-0.05em] text-white">
-          Secret vault
+    <div className="space-y-4">
+      {/* Header */}
+      <div className="bg-gradient-to-r from-slate-800 to-indigo-900 rounded-lg p-6 text-white shadow-xl border-b-4 border-yellow-500">
+        <h2 className="text-2xl font-bold mb-2 flex items-center gap-2">
+          🛡️ Hive Guard
         </h2>
-        <p className="panel-subtitle mt-3">
-          Store shared secrets and control which roles are allowed to reveal them.
+        <p className="text-indigo-200 text-sm">
+          Secure environment variables and credentials with Client-Side AES-256 Encryption.
         </p>
       </div>
 
-      {(currentUserRole === "ADMIN" || currentUserRole === "OWNER") ? (
-        <div className="glass-panel">
-          <p className="panel-title">Add new secret</p>
-          <p className="panel-subtitle">
-            Restrict visibility by role before saving the secret into this hive's vault.
-          </p>
-
-          <form onSubmit={handleSaveSecret} className="mt-6 grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_220px]">
+      {/* Entry Form */}
+      {(currentUserRole === "ADMIN" || currentUserRole === "OWNER") && (
+        <div className="bg-white rounded-lg border-2 border-slate-200 p-6 shadow-sm">
+          <h3 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">
+            🔑 Add New Secret
+          </h3>
+          <form onSubmit={handleSaveSecret} className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <input
               placeholder="VARIABLE_NAME"
               value={keyName}
-              onChange={(event) => setKeyName(event.target.value)}
-              className="input-shell font-mono text-sm"
+              onChange={(e) => setKeyName(e.target.value)}
+              className="px-3 py-2 border-2 border-slate-200 rounded-lg focus:border-yellow-500 outline-none font-mono text-sm"
             />
             <input
               type="password"
-              placeholder="Secret value"
+              placeholder="••••••••"
               value={secretValue}
-              onChange={(event) => setSecretValue(event.target.value)}
-              className="input-shell"
+              onChange={(e) => setSecretValue(e.target.value)}
+              className="px-3 py-2 border-2 border-slate-200 rounded-lg focus:border-yellow-500 outline-none"
             />
-            <select
-              multiple
+            <select 
+              multiple 
               value={visibleTo}
-              onChange={(event) =>
-                setVisibleTo(Array.from(event.target.selectedOptions, (option) => option.value))
-              }
-              className="select-shell min-h-[120px]"
+              onChange={(e) => setVisibleTo(Array.from(e.target.selectedOptions, option => option.value))}
+              className="px-3 py-2 border-2 border-slate-200 rounded-lg text-sm"
             >
-              <option value="OWNER">OWNER only</option>
-              <option value="ADMIN">ADMIN</option>
-              <option value="MEMBER">MEMBER</option>
+              <option value="OWNER">OWNER Only</option>
+              <option value="ADMIN">ADMINs</option>
+              <option value="MEMBER">MEMBERS</option>
             </select>
-            <button type="submit" disabled={isProcessing} className="button-primary">
-              {isProcessing ? "Saving..." : "Save secret"}
+            <button
+              type="submit"
+              disabled={isProcessing}
+              className="bg-yellow-500 text-slate-900 font-bold px-4 py-2 rounded-lg hover:bg-yellow-400 transition-all disabled:opacity-50"
+            >
+              {isProcessing ? "Shielding..." : "Vault Secret"}
             </button>
           </form>
         </div>
-      ) : null}
+      )}
 
-      <div className="glass-panel">
-        <div className="chat-header">
-          <div>
-            <p className="text-kicker">Vault</p>
-            <h3 className="panel-title text-2xl">Active secrets</h3>
-          </div>
-          <span className="status-pill">{secrets.length} secrets</span>
+      {/* Secret Vault Display */}
+      <div className="bg-slate-50 rounded-lg border-2 border-slate-200 overflow-hidden">
+        <div className="bg-slate-200 px-4 py-3 border-b-2 border-slate-300">
+          <h3 className="text-sm font-bold text-slate-700 uppercase tracking-wider">🔐 Active Vault</h3>
         </div>
-
-        <div className="mt-6 space-y-3">
+        
+        <div className="divide-y divide-slate-200">
           {secrets.length === 0 ? (
-            <div className="empty-state">No protected secrets are stored in this hive yet.</div>
+            <p className="p-8 text-center text-slate-400 italic">No shielded secrets in this hive.</p>
           ) : (
-            secrets.map((secret) => {
-              const isRevealed = !!revealedSecrets[secret.id];
-              const displayValue = isRevealed ? secret.value : "••••••••••••";
-
+            secrets.map((s) => {
+              const isRevealed = !!revealedSecrets[s.id];
+              // NEW: Decrypt on the fly for the UI
+              const displayValue = isRevealed ? decryptSecret(s.value) : "••••••••••••";
+              
               return (
-                <article
-                  key={secret.id}
-                  className="rounded-2xl border border-white/10 bg-white/5 p-4 transition hover:bg-white/[0.07]"
-                >
-                  <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
-                    <div className="min-w-0">
-                      <div className="font-mono text-sm font-semibold text-cyan-100">
-                        {secret.keyName}
-                      </div>
-                      <div className="mt-2 flex flex-wrap gap-2">
-                        {secret.visibleTo.map((role) => (
-                          <span
-                            key={role}
-                            className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-200"
-                          >
-                            {role}
-                          </span>
-                        ))}
-                      </div>
+                <div key={s.id} className="p-4 flex items-center justify-between bg-white hover:bg-slate-50 transition-colors">
+                  <div className="flex flex-col">
+                    <span className="font-mono font-bold text-indigo-900">{s.keyName}</span>
+                    <div className="flex gap-1 mt-1">
+                      {s.visibleTo.map(role => (
+                        <span key={role} className="text-[10px] bg-slate-100 px-2 py-0.5 rounded text-slate-600 font-bold border border-slate-200">
+                          {role}
+                        </span>
+                      ))}
                     </div>
-
-                    <div className="flex flex-wrap items-center gap-3">
-                      <code className="rounded-xl border border-white/10 bg-slate-950/40 px-4 py-3 text-xs text-slate-100">
+                  </div>
+                  
+                  <div className="flex items-center gap-3">
+                    <div className="flex items-center bg-slate-100 rounded-lg px-2 border border-slate-200">
+                      <code className="px-2 py-1 text-xs text-slate-600 font-mono min-w-[120px]">
                         {displayValue}
                       </code>
-
-                      <button
-                        onClick={() =>
-                          setRevealedSecrets((prev) => ({ ...prev, [secret.id]: !prev[secret.id] }))
-                        }
-                        className="button-ghost text-sm"
-                        title={isRevealed ? "Hide" : "Reveal"}
+                      
+                      <button 
+                        onClick={() => setRevealedSecrets(prev => ({ ...prev, [s.id]: !prev[s.id] }))}
+                        className="p-1.5 hover:bg-slate-200 rounded text-slate-500 transition-colors"
+                        title={isRevealed ? "Hide" : "Show"}
                         type="button"
                       >
-                        {isRevealed ? "Hide" : "Reveal"}
+                        {isRevealed ? "👁️‍🗨️" : "👁️"}
                       </button>
 
-                      <button
-                        onClick={() => copySecret(secret)}
-                        className={`button-ghost text-sm ${copiedId === secret.id ? "border-emerald-300/25 text-emerald-100" : ""}`}
+                      <button 
+                        onClick={() => {
+                          // NEW: Copy the decrypted value, not the cipher text
+                          const textToCopy = decryptSecret(s.value);
+                          const fallbackCopy = (text) => {
+                            const textArea = document.createElement("textarea");
+                            textArea.value = text;
+                            document.body.appendChild(textArea);
+                            textArea.select();
+                            try {
+                              document.execCommand('copy');
+                              return true;
+                            } catch (err) {
+                              return false;
+                            } finally {
+                              document.body.removeChild(textArea);
+                            }
+                          };
+
+                          const performCopy = async () => {
+                            let success = false;
+                            if (navigator.clipboard && window.isSecureContext) {
+                              try {
+                                await navigator.clipboard.writeText(textToCopy);
+                                success = true;
+                              } catch {
+                                success = fallbackCopy(textToCopy);
+                              }
+                            } else {
+                              success = fallbackCopy(textToCopy);
+                            }
+
+                            if (success) {
+                              setCopiedId(s.id);
+                              setTimeout(() => setCopiedId(null), 2000);
+                            }
+                          };
+
+                          performCopy();
+                        }}
+                        className={`p-1.5 rounded transition-all duration-200 border-l border-slate-200 ml-1 ${
+                          copiedId === s.id ? "bg-green-100 text-green-600" : "hover:bg-slate-200 text-slate-500"
+                        }`}
                         title="Copy to clipboard"
                         type="button"
                       >
-                        {copiedId === secret.id ? "Copied" : "Copy"}
+                        {copiedId === s.id ? "✅" : "📋"}
                       </button>
-
-                      {(currentUserRole === "ADMIN" || currentUserRole === "OWNER") ? (
-                        <button
-                          onClick={() => handleDeleteSecret(secret.id, secret.keyName)}
-                          className="button-danger text-sm"
-                          type="button"
-                        >
-                          Delete
-                        </button>
-                      ) : null}
                     </div>
+
+                    {(currentUserRole === "ADMIN" || currentUserRole === "OWNER") && (
+                      <button 
+                        onClick={() => handleDeleteSecret(s.id, s.keyName)}
+                        className="text-slate-300 hover:text-red-500 transition-colors p-1"
+                        title="Delete Secret"
+                        type="button"
+                      >
+                        🗑️
+                      </button>
+                    )}
                   </div>
-                </article>
+                </div>
               );
             })
           )}
