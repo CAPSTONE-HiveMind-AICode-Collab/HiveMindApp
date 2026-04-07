@@ -1,11 +1,26 @@
 # --- STAGE 1: Build ---
-FROM node:20-alpine AS builder
+FROM node:20-slim AS builder
 WORKDIR /app
-RUN apk add --no-cache libc6-compat
-COPY package.json package-lock.json ./
-RUN npm install --force
+
+# 1. Install build tools for native modules
+RUN apt-get update && apt-get install -y \
+    python3 \
+    make \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Copy ONLY package.json (We will ignore the lockfile for the container build)
+COPY package.json ./
+
+# 3. THE FIX: Force install the exact Linux-GNU binary needed for CSS
+# Then run a standard install to get everything else
+RUN npm install lightningcss-linux-x64-gnu
+RUN npm install
+
+# 4. Now copy the rest of the source
 COPY . .
 
+# [Your ARGs for API Key/Environment Variables]
 # Define the arguments
 ARG NEXT_PUBLIC_FIREBASE_API_KEY
 ARG NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN
@@ -24,25 +39,22 @@ ENV NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=$NEXT_PUBLIC_FIREBASE_MESSAGING_SEN
 ENV NEXT_PUBLIC_FIREBASE_APP_ID=$NEXT_PUBLIC_FIREBASE_APP_ID
 ENV NEXT_PUBLIC_MASTER_HIVE_KEY=$NEXT_PUBLIC_MASTER_HIVE_KEY
 
-ENV NODE_ENV=production
+# 5. Disable Turbopack for Build (Optional but recommended if it keeps failing)
+# Most production builds are more stable with the standard webpack-based build
+ENV NEXT_PRIVATE_LOCAL_TURBOPACK=0
+
 RUN npm run build
 
 # --- STAGE 2: Runner ---
-# (Keep Stage 2 exactly as it was)
-
-# --- STAGE 2: Runner ---
-FROM node:20-alpine AS runner
+FROM node:20-slim AS runner
 WORKDIR /app
-
-# Set runtime environment
 ENV NODE_ENV=production
-
-# Copy necessary files from the builder stage
-# We copy the entire app to ensure node_modules and the .next build are present
-COPY --from=builder /app ./
-
-# Next.js listens on port 3000 by default
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
 EXPOSE 3000
-
-# Start the application
 CMD ["npm", "start"]
+
+
+
