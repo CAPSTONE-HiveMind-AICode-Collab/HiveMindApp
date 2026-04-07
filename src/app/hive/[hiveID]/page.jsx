@@ -1,62 +1,72 @@
 "use client";
-import { getUserRoleForHive, listHiveMembers } from "@/lib/data/roleRepository";
-import { checkPermission } from "@/lib/business/permissionService";
-import { useEffect, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+
+import { useEffect, useMemo, useState } from "react";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { collection, doc, onSnapshot, orderBy, query, setDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
-import { collection, getDocs, doc, setDoc, onSnapshot } from "firebase/firestore";
 import { useUser } from "@/lib/auth/userContext";
+import {
+  getUserRoleForHive,
+  listHiveMembers,
+  markHiveBriefingSeen,
+  setUserRoleForHive,
+} from "@/lib/data/roleRepository";
+import { checkPermission } from "@/lib/business/permissionService";
 import { getAllUnreadCounts, updateLastSeen } from "@/lib/business/chatService";
+import { subscribeToHivePresence, syncHivePresence } from "@/lib/data/presenceRepository";
 import MonitoringDashboard from "@/components/MonitoringDashboard";
 import AuditLogViewer from "@/components/AuditLogViewer";
 import IAMAdminPanel from "@/components/IAMAdminPanel";
 import PermissionBadge from "@/components/PermissionBadge";
+import HiveGuard from "@/components/HiveGuard"; // Restored Import
+import DecisionMemoryPanel from "@/components/DecisionMemoryPanel";
+import TaskBoard from "@/components/TaskBoard";
+import WorkspaceOverviewPanel from "@/components/WorkspaceOverviewPanel";
+import NewMemberBriefPanel from "@/components/NewMemberBriefPanel";
+import UserAvatar from "@/components/UserAvatar";
+
+const dashboardTabs = [
+  { id: "workspace", label: "Workspace" },
+  { id: "work", label: "Work" },
+  { id: "admin", label: "Admin" },
+];
+
+const roleTone = {
+  OWNER: "bg-amber-300/15 text-amber-100 border border-amber-200/25",
+  ADMIN: "bg-violet-300/15 text-violet-100 border border-violet-200/25",
+  MEMBER: "bg-sky-300/15 text-sky-100 border border-sky-200/25",
+  VIEWER: "bg-slate-300/10 text-slate-100 border border-slate-200/15",
+};
 
 export default function HivePage() {
   const { hiveID } = useParams();
+  const searchParams = useSearchParams();
   const router = useRouter();
   const { user, loading } = useUser();
+  const requestedTab = String(searchParams?.get("tab") || "");
+
   const [userRole, setUserRole] = useState(null);
   const [members, setMembers] = useState([]);
   const [honeycombs, setHoneycombs] = useState([]);
+  const [decisions, setDecisions] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [hiveMeta, setHiveMeta] = useState(null);
+  const [presenceMap, setPresenceMap] = useState({});
   const [newHoneycombName, setNewHoneycombName] = useState("");
   const [unreadCounts, setUnreadCounts] = useState({});
-  const [activeTab, setActiveTab] = useState("honeycombs"); // honeycombs, monitoring, audit
+  const [highlightDecisionId, setHighlightDecisionId] = useState("");
+  const [taskDecisionFilterId, setTaskDecisionFilterId] = useState("");
+  const [showBriefing, setShowBriefing] = useState(false);
+  const [activeTab, setActiveTab] = useState(
+    dashboardTabs.some((tab) => tab.id === requestedTab) ? requestedTab : "workspace"
+  );
 
-  // Fetch honeycombs for this hive
   useEffect(() => {
-    if (!user || !userRole) return;
+    if (!requestedTab) return;
+    if (!dashboardTabs.some((tab) => tab.id === requestedTab)) return;
+    setActiveTab(requestedTab);
+  }, [requestedTab]);
 
-    async function fetchHoneycombs() {
-      try {
-        const honeycombRef = collection(db, "Hive", hiveID, "Honeycomb");
-        const snapshot = await getDocs(honeycombRef);
-        const list = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-        setHoneycombs(list);
-      } catch (err) {
-        console.error("Error fetching honeycombs:", err);
-      }
-    }
-
-    fetchHoneycombs();
-  }, [user, hiveID, userRole]);
-
-  // Fetch unread counts for each honeycomb
-  useEffect(() => {
-    if (!user || !hiveID) return;
-
-    async function fetchUnread() {
-      const counts = await getAllUnreadCounts(hiveID, user.uid);
-      setUnreadCounts(counts);
-    }
-
-    fetchUnread();
-
-    const interval = setInterval(fetchUnread, 10000);
-    return () => clearInterval(interval);
-  }, [user, hiveID]);
-
-  // Load user role and hive members
   useEffect(() => {
     if (!user || !hiveID) return;
 
@@ -66,65 +76,169 @@ export default function HivePage() {
           getUserRoleForHive(hiveID, user.uid),
           listHiveMembers(hiveID),
         ]);
-        
-        // Check if user is a member of this hive
-        const isMember = memberList.some(m => m.uid === user.uid);
-        
+
+        const isMember = memberList.some((member) => member.uid === user.uid);
         if (!isMember) {
-          // User is not a member - show access denied
-          alert("You don't have access to this hive. You need to request access via a honeycomb invitation.");
+          alert("You do not have access to this hive.");
           router.push("/dashboard");
           return;
         }
-        
-        setUserRole(role);
+
+        setUserRole(role || "VIEWER");
         setMembers(memberList);
-      } catch (err) {
-        console.error("Failed to load role/members:", err);
-        setUserRole("VIEWER"); // Default to viewer on error
+        const currentMember = memberList.find((member) => member.uid === user.uid);
+        setShowBriefing(Boolean(currentMember && currentMember.hasSeenBriefing === false));
+      } catch (error) {
+        console.error("Failed to load role/members:", error);
+        setUserRole("VIEWER");
       }
     }
 
     loadRoleAndMembers();
-    
-    // Set up real-time listener for members changes
-    const membersRef = collection(db, "Hive", hiveID, "members");
+
+    const membersRef = collection(db, "Hive", String(hiveID), "members");
     const unsubscribe = onSnapshot(membersRef, (snapshot) => {
-      const memberList = snapshot.docs.map(doc => ({
-        uid: doc.id,
-        ...doc.data()
+      const memberList = snapshot.docs.map((memberDoc) => ({
+        uid: memberDoc.id,
+        ...memberDoc.data(),
       }));
       setMembers(memberList);
+      const currentMember = memberList.find((member) => member.uid === user?.uid);
+      setShowBriefing(Boolean(currentMember && currentMember.hasSeenBriefing === false));
     });
 
     return () => unsubscribe();
   }, [user, hiveID, router]);
 
-  // Create new Honeycomb
+  useEffect(() => {
+    if (!user || !hiveID || !userRole) return;
+
+    setUserRoleForHive(String(hiveID), user.uid, userRole, {
+      displayName: user.displayName,
+      email: user.email,
+      photoURL: user.photoURL,
+    }).catch((error) => {
+      console.error("Failed to sync member profile avatar:", error);
+    });
+  }, [hiveID, user, userRole]);
+
+  useEffect(() => {
+    if (!hiveID) return;
+
+    const hiveRef = doc(db, "Hive", String(hiveID));
+    return onSnapshot(
+      hiveRef,
+      (snapshot) => {
+        setHiveMeta(snapshot.exists() ? snapshot.data() : null);
+      },
+      (error) => {
+        console.error("Failed to load hive metadata:", error);
+      }
+    );
+  }, [hiveID]);
+
+  useEffect(() => {
+    if (!user || !hiveID) return;
+
+    const honeycombRef = collection(db, "Hive", String(hiveID), "Honeycomb");
+    const decisionsRef = query(
+      collection(db, "Hive", String(hiveID), "decisionRecords"),
+      orderBy("updatedAt", "desc")
+    );
+    const tasksRef = query(
+      collection(db, "Hive", String(hiveID), "tasks"),
+      orderBy("createdAt", "desc")
+    );
+
+    const unsubHoneycombs = onSnapshot(honeycombRef, (snapshot) => {
+      const list = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      setHoneycombs(list);
+    });
+
+    const unsubDecisions = onSnapshot(
+      decisionsRef,
+      (snapshot) => {
+        setDecisions(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      },
+      (error) => {
+        console.error("Error subscribing to decisions:", error);
+      }
+    );
+
+    const unsubTasks = onSnapshot(
+      tasksRef,
+      (snapshot) => {
+        setTasks(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      },
+      (error) => {
+        console.error("Error subscribing to tasks:", error);
+      }
+    );
+
+    return () => {
+      unsubHoneycombs();
+      unsubDecisions();
+      unsubTasks();
+    };
+  }, [user, hiveID]);
+
+  useEffect(() => {
+    if (!user || !hiveID) return;
+
+    const stopPresenceSync = syncHivePresence({
+      hiveID: String(hiveID),
+      user,
+    });
+
+    const unsubscribe = subscribeToHivePresence(String(hiveID), (nextPresence) => {
+      setPresenceMap(nextPresence || {});
+    });
+
+    return () => {
+      stopPresenceSync?.();
+      unsubscribe?.();
+    };
+  }, [user, hiveID]);
+
+  useEffect(() => {
+    if (!user || !hiveID) return;
+
+    async function fetchUnread() {
+      try {
+        const counts = await getAllUnreadCounts(hiveID, user.uid);
+        setUnreadCounts(counts);
+      } catch (error) {
+        console.error("Failed to load unread counts:", error);
+      }
+    }
+
+    fetchUnread();
+    const interval = setInterval(fetchUnread, 10000);
+    return () => clearInterval(interval);
+  }, [user, hiveID]);
+
   const createHoneycomb = async () => {
-    if (!newHoneycombName || !user) return;
+    if (!newHoneycombName.trim() || !user) return;
 
     const allowed = userRole ? checkPermission(userRole, "CREATE_HONEYCOMB") : true;
     if (!allowed) {
-      alert("You don't have permission to create honeycombs in this hive.");
+      alert("You do not have permission to create honeycombs.");
       return;
     }
 
-    // Generate unique ID: timestamp + random string
     const timestamp = Date.now();
     const randomStr = Math.random().toString(36).substring(2, 8);
     const honeycombID = `${timestamp}_${randomStr}`;
-    
-    await setDoc(doc(db, "Hive", hiveID, "Honeycomb", honeycombID), {
-      name: newHoneycombName,
+
+    await setDoc(doc(db, "Hive", String(hiveID), "Honeycomb", honeycombID), {
+      name: newHoneycombName.trim(),
+      displayName: newHoneycombName.trim(),
       createdAt: new Date(),
     });
 
     setNewHoneycombName("");
-    setHoneycombs([...honeycombs, { id: honeycombID, name: newHoneycombName }]);
   };
 
-  // Click handler: go to honeycomb and update lastSeen
   const openHoneycomb = async (honeycombID) => {
     if (user) {
       await updateLastSeen(hiveID, honeycombID, null, user.uid);
@@ -132,307 +246,305 @@ export default function HivePage() {
     router.push(`/hive/${hiveID}/honeycomb/${honeycombID}`);
   };
 
-  // Loading / Auth
-  if (loading) return <p style={{ textAlign: "center" }}>Loading user info...</p>;
+  const openSourceThread = (honeycombID, parentMessageID) => {
+    if (!honeycombID || !parentMessageID) return;
+    router.push(`/hive/${hiveID}/honeycomb/${honeycombID}?thread=${parentMessageID}`);
+  };
+
+  const copyHoneycombId = async (honeycombID, event) => {
+    event.stopPropagation();
+    await navigator.clipboard.writeText(honeycombID);
+    alert("Honeycomb ID copied.");
+  };
+
+  const enterHive = async () => {
+    if (!user?.uid) return;
+
+    try {
+      await markHiveBriefingSeen(String(hiveID), user.uid);
+      setShowBriefing(false);
+    } catch (error) {
+      console.error("Failed to mark briefing as seen:", error);
+    }
+  };
+
+  const roomNameById = useMemo(
+    () =>
+      Object.fromEntries(
+        honeycombs.map((room) => [String(room.id), room.displayName || room.name || room.id])
+      ),
+    [honeycombs]
+  );
+  
+  const roomStatsById = useMemo(() => {
+    return Object.fromEntries(
+      honeycombs.map((room) => {
+        const roomId = String(room.id);
+        const roomDecisions = decisions.filter(
+          (decision) =>
+            String(decision.honeycombID || decision.source?.honeycombID || "") === roomId
+        );
+        const roomTasks = tasks.filter(
+          (task) => String(task.source?.honeycombID || "") === roomId
+        );
+        const openRoomTasks = roomTasks.filter(
+          (task) => !["done", "closed", "complete", "completed", "archived"].includes(String(task.status || "").toLowerCase())
+        );
+
+        return [
+          roomId,
+          {
+            decisions: roomDecisions.length,
+            openTasks: openRoomTasks.length,
+          },
+        ];
+      })
+    );
+  }, [decisions, honeycombs, tasks]);
+
+  if (loading) {
+    return (
+      <div className="page-shell">
+        <div className="page-frame">
+          <section className="hero-panel">
+            <h1 className="text-display">
+              <span className="text-gradient">Loading access</span>
+            </h1>
+          </section>
+        </div>
+      </div>
+    );
+  }
+
   if (!user) {
     router.replace("/");
     return null;
   }
-  
-  // Still loading role
+
   if (userRole === null) {
-    return <p style={{ textAlign: "center" }}>Loading user info...</p>;
+    return (
+      <div className="page-shell">
+        <div className="page-frame">
+          <section className="hero-panel">
+            <h1 className="text-display">
+              <span className="text-gradient">Checking permissions</span>
+            </h1>
+          </section>
+        </div>
+      </div>
+    );
   }
 
+  const hiveTitle = String(hiveMeta?.name || hiveID);
+  const hiveSubtitle = String(hiveMeta?.description || "").trim() || "Workspace management and AI context.";
+  const ownerAccess = userRole === "OWNER";
+  const adminAccess = userRole === "ADMIN" || userRole === "OWNER";
+
   return (
-    <div
-      style={{
-        backgroundColor: "#fffbee",
-        minHeight: "100vh",
-        padding: "40px",
-        fontFamily: "'Segoe UI', sans-serif",
-        color: "#333",
-      }}
-    >
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <h1 style={{ color: "#d4af37" }}>🐝 Hive: {hiveID}</h1>
-        <button
-          onClick={() => router.push("/dashboard")}
-          style={{
-            backgroundColor: "#d4af37",
-            border: "none",
-            padding: "8px 16px",
-            borderRadius: "5px",
-            cursor: "pointer",
-            color: "#fff",
-            fontWeight: "bold",
-          }}
-        >
-          Back to Dashboard
-        </button>
-      </div>
+    <div className="page-shell">
+      <div className="page-frame">
+        <section className="workspace-shell">
+          <div className="workspace-topbar">
+            <div className="workspace-brand">
+              <div className="workspace-brand-mark">HM</div>
+              <div className="workspace-brand-copy">
+                <div className="workspace-brand-path">
+                  <span>{hiveTitle}</span>
+                  <span>/</span>
+                  <span>Dashboard</span>
+                </div>
+                <h1 className="workspace-brand-title">{hiveTitle}</h1>
+                <p className="workspace-brand-subtitle">{hiveSubtitle}</p>
+              </div>
+            </div>
 
-      <div style={{ marginTop: "8px", fontSize: "0.9rem", display: "flex", alignItems: "center", gap: "10px" }}>
-        <span>Your role in this hive: <strong>{userRole || "loading..."}</strong></span>
-        {user && <PermissionBadge hiveID={hiveID} userId={user.uid} />}
-      </div>
+            <div className="workspace-topbar-actions">
+              <div className="workspace-meta-strip">
+                <span className="status-pill">Role: {userRole}</span>
+                <span className="status-pill">{members.length} members</span>
+              </div>
 
-      {/* Tabs for OWNER */}
-      {userRole === "OWNER" && (
-        <div style={{ marginTop: "20px", display: "flex", gap: "10px", borderBottom: "2px solid #d4af37" }}>
-          <button
-            onClick={() => setActiveTab("honeycombs")}
-            style={{
-              padding: "10px 20px",
-              border: "none",
-              backgroundColor: activeTab === "honeycombs" ? "#d4af37" : "transparent",
-              color: activeTab === "honeycombs" ? "#fff" : "#d4af37",
-              fontWeight: "bold",
-              cursor: "pointer",
-              borderRadius: "5px 5px 0 0",
-            }}
-          >
-            🐝 Honeycombs
-          </button>
-          <button
-            onClick={() => setActiveTab("monitoring")}
-            style={{
-              padding: "10px 20px",
-              border: "none",
-              backgroundColor: activeTab === "monitoring" ? "#d4af37" : "transparent",
-              color: activeTab === "monitoring" ? "#fff" : "#d4af37",
-              fontWeight: "bold",
-              cursor: "pointer",
-              borderRadius: "5px 5px 0 0",
-            }}
-          >
-            📊 Monitoring
-          </button>
-          <button
-            onClick={() => setActiveTab("audit")}
-            style={{
-              padding: "10px 20px",
-              border: "none",
-              backgroundColor: activeTab === "audit" ? "#d4af37" : "transparent",
-              color: activeTab === "audit" ? "#fff" : "#d4af37",
-              fontWeight: "bold",
-              cursor: "pointer",
-              borderRadius: "5px 5px 0 0",
-            }}
-          >
-            🔍 Audit Logs
-          </button>
-          <button
-            onClick={() => setActiveTab("iam")}
-            style={{
-              padding: "10px 20px",
-              border: "none",
-              backgroundColor: activeTab === "iam" ? "#d4af37" : "transparent",
-              color: activeTab === "iam" ? "#fff" : "#d4af37",
-              fontWeight: "bold",
-              cursor: "pointer",
-              borderRadius: "5px 5px 0 0",
-            }}
-          >
-            🔐 IAM Admin
-          </button>
-        </div>
-      )}
-
-      {/* Tab Content */}
-      {activeTab === "honeycombs" && (
-        <>
-          {/* Create Honeycomb */}
-          <div style={{ marginTop: "30px" }}>
-            <input
-              type="text"
-              value={newHoneycombName}
-              onChange={(e) => setNewHoneycombName(e.target.value)}
-              placeholder="New Honeycomb Name"
-              style={{
-                padding: "8px",
-                borderRadius: "5px",
-                border: "1px solid #d4af37",
-                width: "250px",
-                marginRight: "10px",
-              }}
-            />
-            <button
-              onClick={createHoneycomb}
-              style={{
-                backgroundColor: "#d4af37",
-                border: "none",
-                padding: "8px 16px",
-                borderRadius: "5px",
-                cursor: "pointer",
-                color: "#fff",
-                fontWeight: "bold",
-              }}
-            >
-              Create Honeycomb
-            </button>
-          </div>
-
-          {/* Honeycomb List */}
-          <h2 style={{ marginTop: "40px", color: "#b8860b" }}>Honeycombs</h2>
-          <ul style={{ listStyle: "none", padding: 0 }}>
-            {honeycombs.map((honeycomb) => (
-              <li
-                key={honeycomb.id}
-                style={{
-                  backgroundColor: "#fff8dc",
-                  marginBottom: "10px",
-                  padding: "12px 20px",
-                  borderRadius: "8px",
-                  boxShadow: "0 2px 5px rgba(0,0,0,0.1)",
-                  cursor: "pointer",
-                  transition: "transform 0.1s",
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.transform = "scale(1.02)")}
-                onMouseLeave={(e) => (e.currentTarget.style.transform = "scale(1)")}
-              >
-                <div onClick={() => openHoneycomb(honeycomb.id)} style={{ flex: 1 }}>
-                  <div style={{ fontWeight: "bold" }}>{honeycomb.name}</div>
-                  <div style={{ fontSize: "10px", color: "#888", fontFamily: "monospace", marginTop: "4px" }}>
-                    ID: {honeycomb.id}
+              <div className="workspace-topbar-buttons">
+                <div className="workspace-user-pill">
+                  <UserAvatar user={user} className="workspace-user-avatar" size="md" />
+                  <div className="workspace-user-copy">
+                    <strong>{user.displayName || user.email?.split("@")[0] || "User"}</strong>
                   </div>
                 </div>
-                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                  {unreadCounts[honeycomb.id] > 0 && (
-                    <span
-                      style={{
-                        backgroundColor: "#d9534f",
-                        color: "#fff",
-                        borderRadius: "12px",
-                        padding: "4px 8px",
-                        fontSize: "12px",
-                        fontWeight: "bold",
-                        boxShadow: "0 1px 3px rgba(0,0,0,0.2)",
-                      }}
-                    >
-                      {unreadCounts[honeycomb.id]}
-                    </span>
-                  )}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      navigator.clipboard.writeText(honeycomb.id);
-                      alert("Honeycomb ID copied! Share this with others to let them request access.");
-                    }}
-                    style={{
-                      backgroundColor: "#4CAF50",
-                      border: "none",
-                      padding: "6px 12px",
-                      borderRadius: "5px",
-                      cursor: "pointer",
-                      color: "#fff",
-                      fontSize: "11px",
-                      fontWeight: "bold",
-                    }}
-                  >
-                    📋 Copy ID
+                <div className="hud-panel workspace-permission-card">
+                  <PermissionBadge hiveID={hiveID} userId={user.uid} />
+                </div>
+                <button
+                  onClick={() => router.push("/dashboard")}
+                  className="button-ghost"
+                  type="button"
+                >
+                  Back
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="workspace-nav">
+            {dashboardTabs.map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`workspace-nav-button ${activeTab === tab.id ? "active" : ""}`}
+                type="button"
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        {activeTab === "workspace" && (
+          <WorkspaceOverviewPanel
+            hiveID={String(hiveID)}
+            hiveName={hiveTitle}
+            currentUser={user}
+            userRole={userRole}
+            decisions={decisions}
+            tasks={tasks}
+            honeycombs={honeycombs}
+            members={members}
+            presenceMap={presenceMap}
+            onOpenThread={openSourceThread}
+            onOpenDecisionMemory={() => setActiveTab("work")}
+            onOpenTaskBoard={() => setActiveTab("work")}
+          />
+        )}
+
+        {activeTab === "work" && (
+          <>
+            <section className="stack-grid">
+              <div className="glass-panel">
+                <p className="panel-title">Create a honeycomb</p>
+                <div className="action-row mt-5">
+                  <input
+                    type="text"
+                    value={newHoneycombName}
+                    onChange={(event) => setNewHoneycombName(event.target.value)}
+                    placeholder="Name the new honeycomb"
+                    className="input-shell min-w-[240px] flex-1"
+                  />
+                  <button onClick={createHoneycomb} className="button-primary" type="button">
+                    Create honeycomb
                   </button>
                 </div>
-              </li>
-            ))}
-          </ul>
+              </div>
 
-          {/* SetupInterface: Members & roles */}
-          <div style={{ marginTop: "30px" }}>
-            <h2 style={{ fontSize: "1rem", fontWeight: "bold", marginBottom: "8px" }}>
-              Members & roles
-            </h2>
-            {members.length === 0 ? (
-              <p style={{ fontSize: "0.85rem" }}>No member records yet.</p>
-            ) : (
-              <div style={{ display: "grid", gap: "12px", marginTop: "12px" }}>
-                {members.map((m) => (
-                  <div
-                    key={m.uid}
-                    style={{
-                      padding: "12px 16px",
-                      background: "linear-gradient(135deg, #f5f7fa 0%, #e3eaf1 100%)",
-                      borderRadius: "8px",
-                      boxShadow: "0 2px 4px rgba(0,0,0,0.1)",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      fontSize: "0.9rem",
-                    }}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-                      <div
-                        style={{
-                          width: "40px",
-                          height: "40px",
-                          borderRadius: "50%",
-                          background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          color: "white",
-                          fontWeight: "bold",
-                          fontSize: "1.2rem",
-                        }}
-                      >
-                        {(m.displayName || m.email || "?")[0].toUpperCase()}
-                      </div>
-                      <div>
-                        <div style={{ fontWeight: "600", color: "#2d3748" }}>
-                          {m.displayName || m.email || m.uid}
-                        </div>
-                        <div style={{ fontSize: "0.8rem", color: "#718096", marginTop: "2px" }}>
-                          {m.email && m.displayName ? m.email : ""}
+              <div className="glass-panel">
+                <p className="panel-title">Member directory</p>
+                <div className="card-grid mt-6">
+                  {members.map((member) => (
+                    <article key={member.uid} className="surface-card">
+                      <div className="surface-card-inner">
+                        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="flex min-w-0 items-center gap-4">
+                            <UserAvatar
+                              name={member.displayName}
+                              email={member.email}
+                              photoURL={member.photoURL}
+                              className="workspace-member-avatar"
+                              size="fill"
+                            />
+                            <div className="min-w-0 text-white font-semibold truncate">
+                              {member.displayName || member.email || member.uid}
+                            </div>
+                          </div>
+                          <span className={`rounded-full px-3 py-1 text-xs font-semibold uppercase ${roleTone[member.role] || roleTone.VIEWER}`}>
+                            {member.role}
+                          </span>
                         </div>
                       </div>
+                    </article>
+                  ))}
+                </div>
+              </div>
+            </section>
+
+            <section className="glass-panel">
+              <h2 className="panel-title text-2xl">Honeycomb list</h2>
+              <div className="card-grid mt-6">
+                {honeycombs.map((honeycomb) => (
+                  <article key={honeycomb.id} className="surface-card cursor-pointer" onClick={() => openHoneycomb(honeycomb.id)}>
+                    <div className="surface-card-inner space-y-5">
+                      <p className="panel-title">{honeycomb.displayName || honeycomb.name || "Untitled room"}</p>
+                      <button className="button-primary" type="button">Open room</button>
                     </div>
-                    <div
-                      style={{
-                        padding: "6px 14px",
-                        borderRadius: "20px",
-                        fontWeight: "bold",
-                        fontSize: "0.75rem",
-                        background:
-                          m.role === "OWNER"
-                            ? "linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%)"
-                            : m.role === "ADMIN"
-                            ? "linear-gradient(135deg, #a855f7 0%, #7c3aed 100%)"
-                            : m.role === "MEMBER"
-                            ? "linear-gradient(135deg, #3b82f6 0%, #2563eb 100%)"
-                            : "linear-gradient(135deg, #9ca3af 0%, #6b7280 100%)",
-                        color: "white",
-                        boxShadow: "0 2px 4px rgba(0,0,0,0.15)",
-                      }}
-                    >
-                      {m.role === "OWNER" ? "👑 " : m.role === "ADMIN" ? "⚡ " : m.role === "MEMBER" ? "👤 " : "👁️ "}
-                      {m.role}
-                    </div>
-                  </div>
+                  </article>
                 ))}
               </div>
+            </section>
+
+            <DecisionMemoryPanel
+              decisions={decisions}
+              roomNameById={roomNameById}
+              onOpenThread={openSourceThread}
+              highlightDecisionId={highlightDecisionId}
+            />
+
+            <TaskBoard
+              hiveID={String(hiveID)}
+              tasks={tasks}
+              members={members}
+              decisions={decisions}
+              currentUser={user}
+              filterDecisionId={taskDecisionFilterId}
+              onClearDecisionFilter={() => setTaskDecisionFilterId("")}
+              onOpenSource={openSourceThread}
+            />
+          </>
+        )}
+
+        {activeTab === "admin" && (
+          <div className="space-y-6">
+
+            {/* ADMIN & OWNER SECTION (Restored Hive Guard) */}
+            {adminAccess ? (
+              <section className="glass-panel overflow-visible">
+                <HiveGuard hiveID={String(hiveID)} currentUserRole={userRole} />
+              </section>
+            ) : (
+              <section className="glass-panel">
+                <h2 className="panel-title text-2xl text-white">Owner controls only</h2>
+                <p className="panel-subtitle">Contact an owner for elevated access to monitoring and IAM logs.</p>
+              </section>
             )}
+
+            {/* OWNER ONLY SECTION */}
+            {ownerAccess && (
+              <>
+                <section className="glass-panel overflow-visible">
+                  <MonitoringDashboard hiveID={String(hiveID)} />
+                </section>
+                <section className="glass-panel overflow-visible">
+                  <AuditLogViewer hiveID={String(hiveID)} limit={100} />
+                </section>
+                <section className="glass-panel overflow-visible">
+                  <IAMAdminPanel hiveID={String(hiveID)} />
+                </section>
+              </>
+            )}
+
+            
           </div>
-        </>
-      )}
+        )}
+      </div>
 
-      {activeTab === "monitoring" && userRole === "OWNER" && (
-        <div style={{ marginTop: "30px" }}>
-          <MonitoringDashboard hiveID={hiveID} />
-        </div>
-      )}
-
-      {activeTab === "audit" && userRole === "OWNER" && (
-        <div style={{ marginTop: "30px" }}>
-          <AuditLogViewer hiveID={hiveID} limit={100} />
-        </div>
-      )}
-
-      {activeTab === "iam" && userRole === "OWNER" && (
-        <div style={{ marginTop: "30px" }}>
-          <IAMAdminPanel hiveID={hiveID} />
+      {showBriefing && (
+        <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-950/82 p-4 backdrop-blur-sm">
+          <div className="mx-auto max-w-6xl pt-6">
+            <NewMemberBriefPanel
+              hiveID={String(hiveID)}
+              hiveName={hiveTitle}
+              currentUser={user}
+              onEnterHive={enterHive}
+              entryMode
+            />
+          </div>
         </div>
       )}
     </div>

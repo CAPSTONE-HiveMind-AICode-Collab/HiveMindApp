@@ -20,7 +20,10 @@ import { callGeminiAPI } from "@/lib/data/aiRepository";
 import { updateThreadStatus, getThreadParticipants } from "@/lib/data/firestoreRepository";
 import { scheduleTimeBasedNotification, notifyUsers } from "@/lib/business/notificationService";
 import { generateAndStoreThreadSummary } from "@/lib/data/summaryRepository";
-import { isToxicMessage } from "@/lib/business/ToxicityService";
+import { generateAndStoreDecisionRecordForThread } from "@/lib/data/decisionRepository";
+import { touchHiveLastActive } from "@/lib/data/hiveRepository";
+import { NectarRepository } from "@/lib/data/nectarRepository";
+import { isToxicMessage, getToxicityDetails } from "@/lib/business/ToxicityService";
 /* ----------------- Notifications -----------------*/
 
 /* ----------------- Helpers ----------------- */
@@ -42,36 +45,93 @@ const normalizeAttachment = (attachment) => {
   return Array.isArray(attachment) ? attachment : [attachment];
 };
 
-/* ----------------- USER MESSAGES ----------------- */
 export function useSendUserMessage() {
   const { user } = useUser();
 
-  const sendMessage = async (text, hiveID, honeycombID) => {
+  // NOTE: keep signature compatible with your chat page:
+  // sendUserMessage(text, hiveID, honeycombID, [], pendingAttachments)
+  const sendMessage = async (
+    text,
+    hiveID,
+    honeycombID,
+    allUserIds = [],
+    attachment = null
+  ) => {
     if (!user) throw new Error("User not authenticated");
 
-    // 1️⃣ Local Tensor model toxicity check
-    const toxic = await isToxicMessage(text);
-    if (toxic) {
-       alert("Your message appears toxic — please revise and try again.");
-       return;
+    const cleanedText = String(text || "").trim();
+    const normalized = normalizeAttachment(attachment); // array or null
+    const hasAttachments = Array.isArray(normalized) && normalized.length > 0;
+
+    // Toxicity check only when there is text to analyze
+    if (cleanedText) {
+      const toxic = await isToxicMessage(cleanedText);
+      if (toxic) {
+        // Get detailed label breakdown so the user understands what was flagged
+        const details = await getToxicityDetails(cleanedText);
+        const flagged = details
+          .filter((d) => d.match)
+          .map((d) => d.label.replace(/_/g, " "))
+          .join(", ");
+        alert(
+          `Your message was blocked by the content safety filter.\n\nFlagged category: ${flagged || "toxicity"}.\n\nPlease revise your message and try again.`
+        );
+        return;
+      }
     }
 
-    // 2️⃣ Save to Firestore normally
+    //  allow “attachments-only” messages
+    if (!cleanedText && !hasAttachments) return;
+
     const messagesRef = collection(
-      db, "Hive", hiveID, "Honeycomb", honeycombID, "messages"
+      db,
+      "Hive",
+      String(hiveID),
+      "Honeycomb",
+      String(honeycombID),
+      "messages"
     );
 
-    await addDoc(messagesRef, {
-      text,
-      sender: user.displayName,
+    const msgRef = await addDoc(messagesRef, {
+      type: hasAttachments ? "file" : "text",
+      text: cleanedText,
+      attachment: normalized, 
+      sender: user.displayName || user.email || "User",
       senderId: user.uid,
       timestamp: serverTimestamp(),
     });
+
+    //initialize userStatus docs for all users (except sender)
+    const ids = normalizeUserIds(allUserIds);
+    await Promise.all(
+      ids
+        .filter((uid) => uid && uid !== user.uid)
+        .map((uid) =>
+          setDoc(
+            doc(
+              db,
+              "Hive",
+              String(hiveID),
+              "Honeycomb",
+              String(honeycombID),
+              "messages",
+              msgRef.id,
+              "userStatus",
+              String(uid)
+            ),
+            { lastSeen: null },
+            { merge: true }
+          )
+        )
+    );
+
+    await touchHiveLastActive(hiveID);
+
+    return msgRef.id;
   };
 
   return sendMessage;
 }
-
 
 
 /*
@@ -209,18 +269,26 @@ export function useSendThreadMessage() {
   return sendThread;
 }
   */
-
+ 
+//THREAD CREATION METHOD
 export function useSendThreadMessage() {
   const { user } = useUser();
 
   const sendThreadMessage = async (text, hiveID, honeycombID, parentMessageID) => {
     if (!user) throw new Error("User not authenticated");
 
-    // 1️⃣ Tensor toxicity model
+    // 1️⃣ TensorFlow toxicity check (client-side)
     const toxic = await isToxicMessage(text);
     if (toxic) {
-       alert("Your message appears toxic — please revise and try again.");
-       return;
+      const details = await getToxicityDetails(text);
+      const flagged = details
+        .filter((d) => d.match)
+        .map((d) => d.label.replace(/_/g, " "))
+        .join(", ");
+      alert(
+        `Your message was blocked by the content safety filter.\n\nFlagged category: ${flagged || "toxicity"}.\n\nPlease revise your message and try again.`
+      );
+      return;
     }
 
     // 2️⃣ Add reply normally
@@ -236,6 +304,8 @@ export function useSendThreadMessage() {
       timestamp: serverTimestamp(),
       parentMessageId: parentMessageID,
     });
+
+    await touchHiveLastActive(hiveID);
   };
 
   return sendThreadMessage;
@@ -288,6 +358,7 @@ export async function sendAIReply(text, hiveID, honeycombID) {
       senderId: "AI",
       timestamp: serverTimestamp(),
     });
+    await touchHiveLastActive(hid);
   } catch (error) {
     console.error("Failed to send AI reply:", error);
 
@@ -298,6 +369,7 @@ export async function sendAIReply(text, hiveID, honeycombID) {
       senderId: "AI",
       timestamp: serverTimestamp(),
     });
+    await touchHiveLastActive(hid);
   }
 }
 
@@ -457,24 +529,43 @@ export async function closeThreadAndNotify(hiveID, honeycombID, parentMessageID,
       .filter(Boolean)
       .map(String);
 
-    if (userIDs.length === 0) return;
 
     const message = `Thread "${tid}" was closed by ${closedByUser?.displayName || "a user"}.`;
 
-    await notifyUsers(userIDs, {
+    if (userIDs.length > 0) {
+      await notifyUsers(userIDs, {
       type: "THREAD_CLOSED",
       hiveID: hid,
       honeycombID: cid,
       threadID: tid,
       message,
       notifyAt: null,
-    });
+      });
+
+      console.log("THREAD_CLOSED notifications sent to:", userIDs);
+    }
 
     console.log(`✅ THREAD_CLOSED notifications sent to:`, userIDs);
 
     // 4️⃣ Generate and store AI summary for this completed thread
     try {
-      await generateAndStoreThreadSummary(
+      await generateAndStoreDecisionRecordForThread({
+        hiveID,
+        honeycombID,
+        parentMessageID,
+        threadID,
+        closedByUser,
+        summaryText: "",
+      });
+      console.log("Decision record generated and stored for thread:", threadID);
+    } catch (err) {
+      console.error("Failed to generate decision record for thread:", err);
+    }
+
+    let summaryText = "";
+
+    try {
+      summaryText = await generateAndStoreThreadSummary(
         hiveID,
         honeycombID,
         parentMessageID,
@@ -565,3 +656,23 @@ export async function sendAssistantAIReply(promptText, uid) {
     });
   }
 }
+
+//-----------Close thread and save thread to memory----------//
+export const closeThread = async (hiveId, threadId, messages) => {
+  // Step 1: Normal closure logic (Update status in Firestore)
+  await updateThreadStatus(threadId, "closed");
+
+  // Step 2: MANUAL NECTAR EXTRACTION
+  // Format the context for the AI
+  const threadContext = messages
+    .map(m => `${m.sender}: ${m.text}`)
+    .join("\n");
+
+  try {
+    console.log("Distilling Knowledge Nectar...");
+    await NectarRepository.distillAndSave(hiveId, threadContext);
+    console.log("Nectar saved to Hive Memory!");
+  } catch (error) {
+    console.error("Nectar extraction failed, but thread was closed.", error);
+  }
+};

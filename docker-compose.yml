@@ -1,0 +1,51 @@
+services:
+  hivemind:
+    build:
+      context: .
+      args:
+        # This tells Docker to take these values from your local machine's environment
+        - NEXT_PUBLIC_FIREBASE_API_KEY=${NEXT_PUBLIC_FIREBASE_API_KEY}
+        - NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN}
+        - NEXT_PUBLIC_FIREBASE_PROJECT_ID=${NEXT_PUBLIC_FIREBASE_PROJECT_ID}
+        - NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=${NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET}
+        - NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=${NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID}
+        - NEXT_PUBLIC_FIREBASE_APP_ID=${NEXT_PUBLIC_FIREBASE_APP_ID}
+        - NEXT_PUBLIC_MASTER_HIVE_KEY=${NEXT_PUBLIC_MASTER_HIVE_KEY}
+    container_name: hivemind-instance
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.local
+    restart: always
+
+  #Looks at your Docker engine usage "monitoring"
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: hivemind-monitor
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+
+  #Collects the data or the "brain" of your monitoring toolset
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hivemind-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  #The dashboard showing all container data
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hivemind-grafana
+    ports:
+      - "3001:3000" # Access at http://localhost:3001
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin # Default login is admin/admin
+
+  

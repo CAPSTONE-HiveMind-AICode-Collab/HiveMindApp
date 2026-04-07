@@ -34,20 +34,43 @@ export default function ClientLayout({ children }) {
   // ---------------------------------------------------------------------
   // Loading state
   // ---------------------------------------------------------------------
-  if (loading) return <p>Loading user info...</p>;
+  if (loading) {
+    return (
+      <div className="page-shell">
+        <div className="page-frame">
+          <div className="hero-panel">
+            <p className="text-kicker">HiveMind</p>
+            <h1 className="text-display">
+              <span className="text-gradient">Warming up your workspace</span>
+            </h1>
+            <p className="panel-subtitle">
+              Loading identity, notifications, and the rest of the swarm.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // ---------------------------------------------------------------------
   // JSX UI
   // ---------------------------------------------------------------------
   return (
-    <div className="relative min-h-screen">
+    <div className="app-chrome">
+      <div className="app-backdrop" aria-hidden="true">
+        <div className="app-orb one" />
+        <div className="app-orb two" />
+        <div className="app-orb three" />
+        <div className="app-grid" />
+      </div>
+
       {/* Use the NotificationsPanel component */}
       <NotificationsPanel />
 
       {/* Notification Permission Prompt */}
       <NotificationPrompt />
 
-      <div>{children}</div>
+      <div className="app-content">{children}</div>
     </div>
   );
 }

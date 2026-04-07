@@ -13,7 +13,6 @@ export default function JoinHoneycombRequest() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
-  // Pre-fill honeycomb ID from URL parameter
   useEffect(() => {
     const idFromUrl = searchParams.get("honeycombID") || searchParams.get("id");
     if (idFromUrl) {
@@ -21,8 +20,8 @@ export default function JoinHoneycombRequest() {
     }
   }, [searchParams]);
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
+  const handleSubmit = async (event) => {
+    event.preventDefault();
     setLoading(true);
     setMessage("");
     setError("");
@@ -41,62 +40,65 @@ export default function JoinHoneycombRequest() {
 
   if (!user) {
     return (
-      <div className="max-w-md mx-auto p-6 bg-white rounded-lg shadow-md mt-8">
-        <p className="text-gray-600">Please log in to join a honeycomb</p>
+      <div className="glass-panel mx-auto max-w-xl">
+        <span className="hero-chip">Authentication required</span>
+        <h2 className="panel-title mt-5 text-2xl">Sign in to request access</h2>
+        <p className="panel-subtitle mt-3">
+          The join flow needs your account so the hive owner knows who is requesting entry.
+        </p>
       </div>
     );
   }
 
   return (
-    <div className="max-w-md mx-auto p-6 bg-white rounded-lg shadow-md mt-8">
-      <h2 className="text-2xl font-bold mb-4 text-gray-800">Join a Honeycomb</h2>
-      <p className="text-gray-600 mb-4">
-        Enter a honeycomb ID to request access. The owner will be notified and can approve your request.
+    <div className="glass-panel mx-auto max-w-xl">
+      <span className="hero-chip">Access request</span>
+      <h2 className="panel-title mt-5 text-2xl">Join a honeycomb</h2>
+      <p className="panel-subtitle mt-3">
+        Enter a honeycomb ID to request access. The owner will be notified and can approve
+        your request.
       </p>
-      <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-        <p className="text-sm text-blue-800">
-          💡 <strong>Tip:</strong> Ask the honeycomb owner to copy and share the honeycomb ID with you.
+
+      <div className="hud-panel mt-5 border border-cyan-200/15">
+        <p className="text-sm text-slate-100">
+          Ask the honeycomb owner to copy and share the honeycomb ID with you.
         </p>
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-4">
+      <form onSubmit={handleSubmit} className="mt-6 space-y-5">
         <div>
-          <label htmlFor="honeycombID" className="block text-sm font-medium text-gray-700 mb-2">
+          <label htmlFor="honeycombID" className="label-text">
             Honeycomb ID
           </label>
           <input
             id="honeycombID"
             type="text"
             value={honeycombID}
-            onChange={(e) => setHoneycombID(e.target.value)}
+            onChange={(event) => setHoneycombID(event.target.value)}
             placeholder="Enter honeycomb ID..."
-            className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 bg-white"
+            className="input-shell font-mono"
             required
-            style={{ color: '#000', backgroundColor: '#fff' }}
           />
         </div>
 
         <button
           type="submit"
           disabled={loading || !honeycombID.trim()}
-          className="w-full bg-blue-600 text-white py-2 px-4 rounded-lg hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition"
+          className="button-primary w-full"
         >
-          {loading ? "Sending Request..." : "Request to Join"}
+          {loading ? "Sending request..." : "Request access"}
         </button>
       </form>
 
-      {message && (
-        <div className="mt-4 p-3 bg-green-100 border border-green-400 text-green-700 rounded-lg">
+      {message ? (
+        <div className="hud-panel mt-5 border border-emerald-300/20 text-emerald-100">
           {message}
         </div>
-      )}
+      ) : null}
 
-      {error && (
-        <div className="mt-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded-lg">
-          {error}
-        </div>
-      )}
+      {error ? (
+        <div className="hud-panel mt-5 border border-rose-300/20 text-rose-100">{error}</div>
+      ) : null}
     </div>
   );
 }
-

@@ -15,6 +15,7 @@ import {
   setDoc,
   deleteDoc,
 } from "firebase/firestore";
+import { syncHiveDirectoryMetrics } from "@/lib/data/hiveRepository";
 
 import {
   addNotificationToDB,
@@ -271,20 +272,11 @@ export async function approveJoinRequest(notificationID, ownerID, honeycombID, h
       displayName: userData.displayName || requestingUserName || userData.email || "Unknown User",
       email: userData.email || null,
       joinedAt: serverTimestamp(),
+      hasSeenBriefing: false,
+      lastActive: serverTimestamp(),
     });
     
-    // Also add to hive members array for backward compatibility
-    const hiveRef = doc(db, "Hive", hiveID);
-    const hiveSnap = await getDoc(hiveRef);
-    if (hiveSnap.exists()) {
-      const hiveData = hiveSnap.data();
-      const currentMembers = hiveData.members || [];
-      if (!currentMembers.includes(requestingUserID)) {
-        await updateDoc(hiveRef, {
-          members: [...currentMembers, requestingUserID]
-        });
-      }
-    }
+    await syncHiveDirectoryMetrics(hiveID, { touchLastActive: true });
 
     // Log to audit trail
     const auditRef = collection(db, "auditLogs");
