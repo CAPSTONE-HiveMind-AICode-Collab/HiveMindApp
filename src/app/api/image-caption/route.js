@@ -4,7 +4,7 @@ import { NextResponse } from "next/server";
 const CAPTION_API_BASE =
   process.env.NEXT_PUBLIC_CAPTION_API_BASE ||
   process.env.CAPTION_API_BASE ||
-  "http://127.0.0.1:8000"; 
+  "http://127.0.0.1:8001"; 
 
 export async function POST(req) {
   try {
