@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
-import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 
 import {
   useSendUserMessage,
@@ -19,10 +19,7 @@ import {
 import { useUser } from "@/lib/auth/userContext";
 import { callGeminiAPI, askHiveMemory } from "@/lib/data/aiRepository";
 import { NectarRepository } from "@/lib/data/nectarRepository";
-import {
-  buildAskAIContext,
-  resolveScopeForRole,
-} from "@/lib/business/contextBuilderService";
+import { buildAskAIContext } from "@/lib/business/contextBuilderService";
 import { db } from "@/lib/firebase/config";
 import {
   collection,
@@ -41,213 +38,31 @@ import FileUploader from "@/components/fileUploader";
 import AttachmentList from "@/components/attachmentList";
 
 import CreateTaskModal from "@/components/CreateTaskModal";
-import LogDecisionModal from "@/components/LogDecisionModal";
 import { createTaskFromMessage } from "@/lib/data/taskRepository";
-import { normalizeChatCitationPayload } from "@/lib/ai/structuredOutput";
-import {
-  createDecisionRecord,
-  DECISION_STATUSES,
-} from "@/lib/data/decisionRepository";
-
-const DEFAULT_AI_MODEL = "gemini-2.5-flash";
-const ROOM_TABS = [
-  { id: "chat", label: "Chat" },
-  { id: "decisions", label: "Decisions" },
-  { id: "tasks", label: "Tasks" },
-  { id: "files", label: "Files" },
-];
-const CLOSED_TASK_STATUSES = new Set([
-  "done",
-  "closed",
-  "complete",
-  "completed",
-  "archived",
-  "cancelled",
-  "canceled",
-]);
-const INCIDENT_PATTERNS = [
-  /\b502\b/i,
-  /\b503\b/i,
-  /\b404\b/i,
-  /\bdown\b/i,
-  /\bbroken\b/i,
-  /\berror\b/i,
-  /\bcrash\b/i,
-  /\bfailing\b/i,
-  /\boutage\b/i,
-  /\bnot working\b/i,
-  /\bproduction issue\b/i,
-  /\bp0\b/i,
-  /\bp1\b/i,
-  /\bincident\b/i,
-];
-
-function truncateText(value, maxLength = 96) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
-  if (text.length <= maxLength) return text;
-  return `${text.slice(0, maxLength - 1).trim()}...`;
-}
-
-function matchesIncident(text) {
-  return INCIDENT_PATTERNS.some((pattern) => pattern.test(String(text || "")));
-}
-
-function hasCodeBlock(text) {
-  return /```[\s\S]*?```/.test(String(text || ""));
-}
-
-function looksLikeStackTrace(text) {
-  return /(^|\n)\s*at\s.+/m.test(String(text || "")) || /\b(?:Error|Exception):/m.test(String(text || ""));
-}
-
-function looksLikeDiff(text) {
-  return /(^|\n)(@@|\+\+\+|---|\+[^\s+]|-[^\s-])/m.test(String(text || ""));
-}
-
-function buildCodeCopilotPrompt(task, content) {
-  const instructions = {
-    explain:
-      "Explain what this code does in plain English for a mixed technical team. Keep it under 4 sentences.",
-    review:
-      "Review this code like a senior engineer. Call out bugs, security issues, performance risks, and decision conflicts. Use a short bullet list.",
-    suggest_fix:
-      "Identify the likely bug and write the corrected code. Explain the fix in 1 sentence.",
-    debug:
-      "Diagnose the stack trace, name the root cause, and provide the exact fix with corrected code if helpful.",
-  };
-
-  return `Code Copilot task: ${task}\n${instructions[task] || instructions.explain}\n\nCode or error:\n${String(content || "").trim()}`;
-}
-
-function toTitleCase(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (character) => character.toUpperCase());
-}
-
-function formatStamp(value) {
-  if (!value) return "just now";
-  const date = value?.toDate ? value.toDate() : new Date(value);
-  if (Number.isNaN(date.getTime())) return "just now";
-  return date.toLocaleString([], {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
-function firstMeaningfulLine(value, fallback = "Decision Record") {
-  return (
-    String(value || "")
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find(Boolean) || fallback
-  );
-}
-
-function tokenize(value) {
-  return String(value || "")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length >= 3);
-}
-
-function scoreDecisionMatch(record, text) {
-  const queryTokens = tokenize(text);
-  if (!queryTokens.length) return 0;
-
-  const searchable = [
-    record.title,
-    record.summary,
-    record.decision,
-    record.rationale,
-    ...(Array.isArray(record.tags) ? record.tags : []),
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-
-  return queryTokens.reduce((score, token) => {
-    return score + (searchable.includes(token) ? 1 : 0);
-  }, 0);
-}
-
-function findRelevantDecisions(records, text) {
-  if (!Array.isArray(records) || !text) return [];
-
-  return records
-    .map((record) => ({ record, score: scoreDecisionMatch(record, text) }))
-    .filter((item) => item.score > 0)
-    .sort((left, right) => right.score - left.score)
-    .slice(0, 2)
-    .map((item) => item.record);
-}
-
-function formatDecisionCitation(record) {
-  const title = record.title || "Decision";
-  const room = record.honeycombID || record.source?.honeycombID || "unknown-room";
-  const source = record.parentMessageID || record.source?.parentMessageID || "source";
-  return `${title} | ${room} | ${source}`;
-}
-
-function ensureDecisionCitation(reply, matchedDecisions) {
-  const text = String(reply || "").trim();
-  if (!text || !matchedDecisions.length) return text;
-  if (/^Citation:/im.test(text)) return text;
-
-  const referencesPastContext = /(past|previous|similar|before|earlier|decision|incident)/i.test(
-    text
-  );
-
-  if (!referencesPastContext) return text;
-
-  return `${text}\n\nCitation: [${matchedDecisions
-    .map(formatDecisionCitation)
-    .join("] [")}]`;
-}
-
-function buildChatReplyWithCitations(rawReply, matchedDecisions) {
-  const parsed = normalizeChatCitationPayload(
-    rawReply,
-    matchedDecisions.map((decision) => decision.id)
-  );
-  if (!parsed) {
-    return ensureDecisionCitation(rawReply, matchedDecisions);
-  }
-
-  const answer = String(parsed.answer || parsed.reply || "").trim();
-  const citedDecisions = Array.isArray(parsed.citationDecisionIds)
-    ? parsed.citationDecisionIds
-        .map((decisionId) =>
-          matchedDecisions.find((record) => String(record.id) === String(decisionId))
-        )
-        .filter(Boolean)
-    : [];
-
-  if (!citedDecisions.length) {
-    return answer || ensureDecisionCitation(rawReply, matchedDecisions);
-  }
-
-  return `${answer}\n\nCitation: [${citedDecisions.map(formatDecisionCitation).join("] [")}]`;
-}
 
 
 export default function HoneycombChatPage() {
   const params = useParams();
-  const searchParams = useSearchParams();
   const hiveID = String(params?.hiveID ?? "");
   const honeycombID = String(params?.honeycombID ?? "");
-  const requestedThreadMessageID = String(searchParams?.get("thread") ?? "");
 
   const router = useRouter();
   const { user, loading } = useUser();
 
   const [message, setMessage] = useState("");
+  // queued attachments (upload now, send later)
   const [pendingAttachments, setPendingAttachments] = useState([]);
-  const [aiScope, setAiScope] = useState("last_5");
+  const [uploadingAttachment, setUploadingAttachment] = useState(false);
+
+  const [selectedModel, setSelectedModel] = useState(
+    process.env.NEXT_PUBLIC_DEFAULT_MODEL ||
+      (typeof window !== "undefined"
+        ? window?.GEMINI_MODEL || process.env.GEMINI_MODEL
+        : "gemini-2.5-flash")
+  );
+
+  const [aiScope, setAiScope] = useState("message");
+  const [allowAIDecrypt, setAllowAIDecrypt] = useState(false);
   const [messages, setMessages] = useState([]);
   const [threads, setThreads] = useState({});
   const [loadingAI, setLoadingAI] = useState(false);
@@ -256,12 +71,6 @@ export default function HoneycombChatPage() {
   const [userRole, setUserRole] = useState(null);
   const [userRoles, setUserRoles] = useState({});
   const [userColors, setUserColors] = useState({});
-  const [memberDirectory, setMemberDirectory] = useState([]);
-  const [decisionRecords, setDecisionRecords] = useState([]);
-  const [taskRecords, setTaskRecords] = useState([]);
-  const [hiveMeta, setHiveMeta] = useState(null);
-  const [roomMeta, setRoomMeta] = useState(null);
-  const [activeSubtab, setActiveSubtab] = useState("chat");
 
   const [summaries, setSummaries] = useState([]);
   const [summariesLoading, setSummariesLoading] = useState(true);
@@ -278,14 +87,10 @@ export default function HoneycombChatPage() {
   const recognitionRef = useRef(null);
 
   const messagesEndRef = useRef(null);
-  const requestedThreadHandledRef = useRef(false);
 
   // Task modal state
   const [taskModalOpen, setTaskModalOpen] = useState(false);
   const [taskSourceMsg, setTaskSourceMsg] = useState(null);
-  const [decisionModalOpen, setDecisionModalOpen] = useState(false);
-  const [decisionSourceMsg, setDecisionSourceMsg] = useState(null);
-  const [loggingDecisionId, setLoggingDecisionId] = useState("");
 
   const sendUserMessage = useSendUserMessage();
   const sendThreadMessage = useSendThreadMessage();
@@ -293,28 +98,22 @@ export default function HoneycombChatPage() {
   /* ----------------- PERMISSION HELPER ----------------- */
   const canChat = userRole ? checkPermission(userRole, "SEND_MESSAGE") : true;
 
-  useEffect(() => {
-    setAiScope((currentScope) =>
-      resolveScopeForRole(currentScope || "last_5", userRole)
-    );
-  }, [userRole]);
-
   /* ----------------- COLORS & ROLE EMOJI ----------------- */
   const getUserColor = (userId) => {
     if (!userId) return "border-gray-400 bg-gray-50";
     if (userColors[userId]) return userColors[userId];
 
     const colors = [
-      "border-amber-300/30 bg-amber-300/10",
-      "border-blue-300/30 bg-blue-300/10",
-      "border-emerald-300/30 bg-emerald-300/10",
-      "border-violet-300/30 bg-violet-300/10",
-      "border-pink-300/30 bg-pink-300/10",
-      "border-indigo-300/30 bg-indigo-300/10",
-      "border-orange-300/30 bg-orange-300/10",
-      "border-teal-300/30 bg-teal-300/10",
-      "border-rose-300/30 bg-rose-300/10",
-      "border-cyan-300/30 bg-cyan-300/10",
+      "border-yellow-500 bg-yellow-50",
+      "border-blue-500 bg-blue-50",
+      "border-green-500 bg-green-50",
+      "border-purple-500 bg-purple-50",
+      "border-pink-500 bg-pink-50",
+      "border-indigo-500 bg-indigo-50",
+      "border-orange-500 bg-orange-50",
+      "border-teal-500 bg-teal-50",
+      "border-red-500 bg-red-50",
+      "border-cyan-500 bg-cyan-50",
     ];
 
     const randomColor = colors[Math.floor(Math.random() * colors.length)];
@@ -323,33 +122,46 @@ export default function HoneycombChatPage() {
   };
 
   const normalizeAttachments = (msg) => {
-    const raw =
-      msg?.attachment ??
-      msg?.attachments ??
-      msg?.files ??
-      msg?.file ??
-      msg?.meta ??
-      null;
+  const raw =
+    msg?.attachment ??
+    msg?.attachments ??
+    msg?.files ??
+    msg?.file ??
+    msg?.meta ??
+    null;
 
-    if (!raw) return [];
-    const arr = Array.isArray(raw) ? raw : [raw];
+  if (!raw) return [];
+  const arr = Array.isArray(raw) ? raw : [raw];
 
-    return arr
-      .filter(Boolean)
-      .map((a) => ({
-        ...a,
-        name:
-          a.name ??
-          a.filename ??
-          a.originalName ??
-          (typeof a.path === "string" ? a.path.split("/").pop() : undefined) ??
-          "file",
-        url: a.url ?? a.downloadURL ?? a.downloadUrl ?? a.storageUrl ?? "",
-        contentType: a.contentType ?? a.type ?? a.mimeType ?? "unknown",
-        size: a.size ?? a.bytes ?? a.fileSize ?? 0,
-        text: a.text ?? "",
-      }));
-  };
+  return arr
+    .filter(Boolean)
+    .map((a) => ({
+      ...a,
+      name:
+        a.name ??
+        a.filename ??
+        a.originalName ??
+        (typeof a.path === "string" ? a.path.split("/").pop() : undefined) ??
+        "file",
+      url: a.url ?? a.downloadURL ?? a.downloadUrl ?? a.storageUrl ?? "",
+      contentType: a.contentType ?? a.type ?? a.mimeType ?? "unknown",
+      size: a.size ?? a.bytes ?? a.fileSize ?? 0,
+
+      text: a.text ?? "",
+      extractedText: a.extractedText ?? "",
+      imageDescription: a.imageDescription ?? "",
+
+      rawCaption: a.rawCaption ?? "",
+      captionRisk: a.captionRisk ?? "",
+      captionNotes: Array.isArray(a.captionNotes) ? a.captionNotes : [],
+
+      extractionMethod: a.extractionMethod ?? "",
+      extractionStatus: a.extractionStatus ?? "",
+      extractionError: a.extractionError ?? "",
+      isDocumentLike: !!a.isDocumentLike,
+      ocrConfidence: a.ocrConfidence ?? null,
+    }));
+};
 
   const getRoleEmoji = (role) => {
     const roleMap = {
@@ -373,12 +185,7 @@ const handleSearchMemory = async (e) => {
   setIsSearchingMemory(true);
   setMemoryResponse("");
   try {
-    const answer = await askHiveMemory(hiveID, memoryQuery, DEFAULT_AI_MODEL, {
-      hiveID,
-      honeycombID,
-      scope: resolveScopeForRole("message", userRole),
-      feature: "memory_query",
-    });
+    const answer = await askHiveMemory(hiveID, memoryQuery, selectedModel);
     setMemoryResponse(answer);
   } catch (err) {
     console.error("Memory search failed:", err);
@@ -467,38 +274,6 @@ const handleSearchMemory = async (e) => {
     loadSummaries();
   }, [loadSummaries]);
 
-  useEffect(() => {
-    if (!hiveID || !honeycombID) return;
-
-    const hiveRef = doc(db, "Hive", String(hiveID));
-    const roomRef = doc(db, "Hive", String(hiveID), "Honeycomb", String(honeycombID));
-
-    const unsubscribeHive = onSnapshot(
-      hiveRef,
-      (snapshot) => {
-        setHiveMeta(snapshot.exists() ? snapshot.data() : null);
-      },
-      (error) => {
-        console.error("Failed to load hive metadata:", error);
-      }
-    );
-
-    const unsubscribeRoom = onSnapshot(
-      roomRef,
-      (snapshot) => {
-        setRoomMeta(snapshot.exists() ? snapshot.data() : null);
-      },
-      (error) => {
-        console.error("Failed to load room metadata:", error);
-      }
-    );
-
-    return () => {
-      unsubscribeHive();
-      unsubscribeRoom();
-    };
-  }, [hiveID, honeycombID]);
-
   /* ----------------- LOAD USER ROLE FOR HIVE (real-time) ----------------- */
   useEffect(() => {
     if (!user || !hiveID) return;
@@ -527,17 +302,10 @@ const handleSearchMemory = async (e) => {
         const membersRef = collection(db, "Hive", hiveID, "members");
         const snap = await getDocs(membersRef);
         const roles = {};
-        const memberList = snap.docs.map((d) => ({
-          uid: d.id,
-          ...d.data(),
-        }));
         snap.docs.forEach((d) => {
           roles[d.id] = d.data()?.role;
         });
-        if (!cancelled) {
-          setUserRoles(roles);
-          setMemberDirectory(memberList);
-        }
+        if (!cancelled) setUserRoles(roles);
       },
       (err) => {
         console.error("Failed to load user role for hive:", err);
@@ -553,38 +321,6 @@ const handleSearchMemory = async (e) => {
       unsubscribe();
     };
   }, [user, hiveID, honeycombID, router]);
-
-  useEffect(() => {
-    if (!hiveID) return;
-
-    const decisionsRef = collection(db, "Hive", hiveID, "decisionRecords");
-    const tasksRef = collection(db, "Hive", hiveID, "tasks");
-
-    const unsubscribeDecisions = onSnapshot(
-      decisionsRef,
-      (snapshot) => {
-        setDecisionRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-      },
-      (error) => {
-        console.error("Failed to load decision records:", error);
-      }
-    );
-
-    const unsubscribeTasks = onSnapshot(
-      tasksRef,
-      (snapshot) => {
-        setTaskRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
-      },
-      (error) => {
-        console.error("Failed to load tasks:", error);
-      }
-    );
-
-    return () => {
-      unsubscribeDecisions();
-      unsubscribeTasks();
-    };
-  }, [hiveID]);
 
   /* ----------------- MAIN CHAT SUBSCRIPTION ----------------- */
   useEffect(() => {
@@ -735,50 +471,81 @@ const handleSearchMemory = async (e) => {
 
   /* ----------------- FILE UPLOAD (QUEUE ONLY) ----------------- */
   const handleFileUploaded = async (meta) => {
-    if (!canChat) {
-      alert("You have view-only access in this hive and cannot upload files.");
-      return;
-    }
+  if (!canChat) {
+    alert("You have view-only access in this hive and cannot upload files.");
+    return;
+  }
 
-    const arr = Array.isArray(meta) ? meta : meta ? [meta] : [];
-    if (arr.length === 0) return;
+  const arr = Array.isArray(meta) ? meta : meta ? [meta] : [];
+  if (arr.length === 0) return;
 
-    // queue it; don't send message yet
-    setPendingAttachments((prev) => [...prev, ...arr]);
-  };
+  setPendingAttachments((prev) => [...prev, ...arr]);
+};
 
   /* ----------------- SEND MESSAGE (TEXT + QUEUED FILES) ----------------- */
   const handleSendMessage = async (e) => {
-    e.preventDefault();
+  e.preventDefault();
 
-    if (!canChat) {
-      alert("You have view-only access in this hive and cannot send messages.");
-      return;
-    }
+  if (!canChat) {
+    alert("You have view-only access in this hive and cannot send messages.");
+    return;
+  }
 
-    const text = message.trim();
-    const hasAttachments = pendingAttachments.length > 0;
+  if (uploadingAttachment) {
+    alert("Please wait for the file upload to finish before sending.");
+    return;
+  }
 
-    //  allow attachments-only
-    if (!text && !hasAttachments) return;
+  const text = message.trim();
+  const hasAttachments = pendingAttachments.length > 0;
 
-    try {
-      await sendUserMessage(text, hiveID, honeycombID, [], pendingAttachments);
+  if (!text && !hasAttachments) return;
 
-      // reset composer
-      setMessage("");
-      setPendingAttachments([]);
+  try {
+    const attachmentsToSend = pendingAttachments.map((a) => ({
+      name: a?.name || "",
+      size: a?.size || 0,
+      contentType: a?.contentType || "application/octet-stream",
+      url: a?.url || "",
+      storagePath: a?.storagePath || "",
+      uploadedAt: a?.uploadedAt || Date.now(),
 
-      const unreadCount = await getHoneycombUnreadCount(
-        hiveID,
-        honeycombID,
-        user.uid
-      );
-      setUnreadMessageCount(unreadCount);
-    } catch (err) {
-      console.error("Send message failed:", err);
-    }
-  };
+      text: a?.text || null,
+      extractedText: a?.extractedText || null,
+      imageDescription: a?.imageDescription || null,
+
+      rawCaption: a?.rawCaption || null,
+      captionRisk: a?.captionRisk || null,
+      captionNotes: Array.isArray(a?.captionNotes) ? a.captionNotes : [],
+
+      extractionMethod: a?.extractionMethod || null,
+      extractionStatus: a?.extractionStatus || null,
+      extractionError: a?.extractionError || null,
+      isDocumentLike: !!a?.isDocumentLike,
+      ocrConfidence: a?.ocrConfidence ?? null,
+    }));
+
+    await sendUserMessage(
+      text,
+      hiveID,
+      honeycombID,
+      [],
+      attachmentsToSend
+    );
+
+    setMessage("");
+    setPendingAttachments([]);
+
+    const unreadCount = await getHoneycombUnreadCount(
+      hiveID,
+      honeycombID,
+      user.uid
+    );
+    setUnreadMessageCount(unreadCount);
+  } catch (err) {
+    console.error("Send message failed:", err);
+  }
+};
 
   /* ----------------- SEND THREAD MESSAGE ----------------- */
   const handleSendThread = async (text, parentMessageID) => {
@@ -805,158 +572,197 @@ const handleSearchMemory = async (e) => {
     }
   };
 
-  /* ----------------- AI REPLY (context + attachments) ----------------- */
-    /* ----------------- AI REPLY (scoped context + attachments + privacy) ----------------- */
-  const handleAIReply = async (msgOrText, scope = "message") => {
-    const msg =
-      typeof msgOrText === "object" && msgOrText !== null
-        ? msgOrText
-        : { text: String(msgOrText ?? ""), attachment: null };
-    const effectiveScope = resolveScopeForRole(scope, userRole);
+/* ----------------- AI REPLY (scoped context + attachments + privacy) ----------------- */
+const handleAIReply = async (msgOrText, scope = "message") => {
+  const msg =
+    typeof msgOrText === "object" && msgOrText !== null
+      ? msgOrText
+      : { text: String(msgOrText ?? ""), attachment: null };
 
-    if (!canChat) {
-      alert("You have view-only access in this hive and cannot use AI features.");
-      return;
+  if (!canChat) {
+    alert("You have view-only access in this hive and cannot use AI features.");
+    return;
+  }
+
+  try {
+    setLoadingAI(true);
+
+    const attachments = normalizeAttachments(msg);
+    const MAX_ATTACHMENT_CHARS_TO_AI = 8000;
+
+    const hasExtractedAttachmentText = attachments.some(
+      (a) => String(a?.extractedText || a?.text || "").trim().length > 0
+    );
+    const hasDocumentWithoutText = attachments.some(
+      (a) => a?.isDocumentLike && !String(a?.extractedText || a?.text || "").trim()
+    );
+
+    const attachmentPolicy =
+      attachments.length > 0
+        ? `You are analyzing chat attachments.
+If extracted OCR text or document text is present, base your answer primarily on that text.
+Summarize what the text says, identify important fields, and answer the user's question from the extracted text.
+Only use image description as fallback context when no extracted text is available.
+Do not invent identities, emotions, events, locations, or storylines beyond the stored attachment data.
+If a caption is marked as low/medium/high reliability, treat it cautiously and do not embellish.
+If the attachment looks document-like but no text was extracted, say clearly that OCR/text extraction was unavailable or failed.`
+        : "";
+
+    const attachmentTextBlock = attachments
+      .map((a) => {
+        const parts = [];
+
+        if (a.extractedText) {
+          const sliced = a.extractedText.slice(0, MAX_ATTACHMENT_CHARS_TO_AI);
+          const truncated =
+            a.extractedText.length > MAX_ATTACHMENT_CHARS_TO_AI
+              ? "\n\n[TRUNCATED]"
+              : "";
+          parts.push(
+            `Extracted OCR text (${a.name || "image"}):\n${sliced}${truncated}`
+          );
+        } else if (a.text && !a.imageDescription) {
+          const sliced = a.text.slice(0, MAX_ATTACHMENT_CHARS_TO_AI);
+          const truncated =
+            a.text.length > MAX_ATTACHMENT_CHARS_TO_AI
+              ? "\n\n[TRUNCATED]"
+              : "";
+          parts.push(
+            `Attached text content (${a.name || "file"}):\n${sliced}${truncated}`
+          );
+        }
+
+        if (a.imageDescription) {
+          parts.push(
+            `Safer image description (${a.name || "image"}): ${a.imageDescription}`
+          );
+        }
+
+        if (
+          a.rawCaption &&
+          a.rawCaption !== a.imageDescription &&
+          a.captionRisk === "low"
+        ) {
+          parts.push(
+            `Raw model caption (${a.name || "image"}): ${a.rawCaption}`
+          );
+        }
+
+        if (a.extractionMethod) {
+          parts.push(
+            `Attachment extraction method (${a.name || "image"}): ${a.extractionMethod}`
+          );
+        }
+
+        if (a.extractionStatus) {
+          parts.push(
+            `Attachment extraction status (${a.name || "image"}): ${a.extractionStatus}`
+          );
+        }
+
+        if (a.extractionError) {
+          parts.push(
+            `Attachment extraction error (${a.name || "image"}): ${a.extractionError}`
+          );
+        }
+
+        if (a.captionRisk) {
+          parts.push(
+            `Caption reliability (${a.name || "image"}): ${a.captionRisk}`
+          );
+        }
+
+        return parts.join("\n\n");
+      })
+      .filter(Boolean)
+      .join("\n\n");
+
+    const attachmentMetaBlock =
+      attachments.length > 0
+        ? `\n\nAttached file metadata:\n${attachments
+            .map((a) => {
+              const sizeKB = Math.round((a?.size || 0) / 1024);
+              return `- name: ${a?.name || "file"} | type: ${
+                a?.contentType || "unknown"
+              } | size: ${sizeKB}KB | url: ${a?.url || "(no url)"}`;
+            })
+            .join("\n")}`
+        : "";
+
+    const baseText = String(msg?.text || "").trim();
+
+    let promptBody = `${attachmentPolicy}\n\n${baseText}${attachmentTextBlock}${attachmentMetaBlock}`.trim();
+
+    if (!baseText && hasExtractedAttachmentText) {
+      promptBody =
+        `${attachmentPolicy}\n\n` +
+        `The user clicked Ask AI on an attachment-focused message.\n` +
+        `Explain what you understand from the extracted attachment text.\n` +
+        `If it is a document, summarize the key contents and notable fields.\n\n` +
+        `${attachmentTextBlock}${attachmentMetaBlock}`.trim();
     }
 
-    try {
-      setLoadingAI(true);
-
-      // 1) Collect attachments from THIS message only
-      const attachments = msg?.attachment
-        ? Array.isArray(msg.attachment)
-          ? msg.attachment
-          : [msg.attachment]
-        : [];
-
-      // 2) Build text/description blocks from attachments
-      const MAX_ATTACHMENT_CHARS_TO_AI = 8000;
-
-      const attachmentTextBlock = attachments
-        .filter((a) => a?.text || a?.imageDescription)
-        .map((a) => {
-          const hasText = !!a.text;
-          const hasDesc = !!a.imageDescription;
-          const parts = [];
-
-          if (hasText) {
-            const sliced = a.text.slice(0, MAX_ATTACHMENT_CHARS_TO_AI);
-            const truncated =
-              a.text.length > MAX_ATTACHMENT_CHARS_TO_AI ? "\n\n[TRUNCATED]" : "";
-            parts.push(
-              `Attached text content (${a.name || "file.txt"}):\n${sliced}${truncated}`
-            );
-          }
-
-          if (hasDesc) {
-            parts.push(
-              `Image description (${a.name || "image"}): ${a.imageDescription}`
-            );
-          }
-
-          return parts.join("\n\n");
-        })
-        .join("\n\n");
-
-      const attachmentMetaBlock =
-        attachments.length > 0
-          ? `\n\nAttached file metadata:\n${attachments
-              .map((a) => {
-                const sizeKB = Math.round((a?.size || 0) / 1024);
-                return `- name: ${a?.name || "file"} | type: ${
-                  a?.contentType || "unknown"
-                } | size: ${sizeKB}KB | url: ${a?.url || "(no url)"}`;
-              })
-              .join("\n")}`
-          : "";
-
-      // 3) Base text from the clicked message
-      const baseText = String(msg?.text || "").trim();
-
-      let promptBody = `${baseText}${attachmentTextBlock}${attachmentMetaBlock}`.trim();
-
-      // If no plain text but we *do* have files, give the AI some instructions
-      if (!promptBody && attachments.length > 0) {
-        promptBody =
-          `A user uploaded file(s) to a chat message, but plain text content was not extracted.\n` +
-          `${attachmentMetaBlock}\n\nReply with:\n` +
-          `1) A short acknowledgement\n2) What you can and cannot do without parsing the file contents\n` +
-          `3) Next best step\n4) Suggestions.`;
-      }
-
-      // If still nothing to say, bail
-      if (!promptBody) return;
-
-      const matchedDecisions = findRelevantDecisions(decisionRecords, promptBody);
-      const decisionContext = matchedDecisions.length
-        ? `Relevant past decisions:
-${matchedDecisions
-            .map(
-              (record) =>
-                `- id ${record.id} | ${record.title || "Decision"} | room ${
-                  record.honeycombID || record.source?.honeycombID || "unknown"
-                } | summary ${
-                  record.summary || record.decision || "No summary"
-                } | citation [${formatDecisionCitation(record)}]`
-            )
-            .join("\n")}
-
-Return ONLY raw JSON in this exact shape:
-{
-  "answer": "string",
-  "citationDecisionIds": ["decision-id"]
-}
-
-Rules:
-- citationDecisionIds must only use IDs from the relevant past decisions list above.
-- If you did not rely on a past decision, return an empty array.
-- Do not invent decisions or citations.`
-        : `Return ONLY raw JSON in this exact shape:
-{
-  "answer": "string",
-  "citationDecisionIds": []
-}
-
-Do not invent past decisions or citations.`;
-
-      const { prompt, history } = buildAskAIContext({
-        scope: effectiveScope,
-        messages,
-        targetMessage: msg,
-        promptBody: `${promptBody}\n\n${decisionContext}`,
-      });
-
-      const aiText = await callGeminiAPI(prompt, DEFAULT_AI_MODEL, history, {
-        hiveID,
-        honeycombID,
-        scope: effectiveScope,
-        feature: "chat_reply",
-      });
-
-      // 6) Save AI reply as a normal chat message
-      const messagesRef = collection(
-        db,
-        "Hive",
-        hiveID,
-        "Honeycomb",
-        honeycombID,
-        "messages"
-      );
-
-      await addDoc(messagesRef, {
-        type: "text",
-        text: buildChatReplyWithCitations(aiText, matchedDecisions),
-        attachment: null,
-        sender: "Hive AI",
-        senderId: "AI",
-        timestamp: serverTimestamp(),
-      });
-    } catch (err) {
-      console.error("AI request failed:", err);
-    } finally {
-      setLoadingAI(false);
+    if (!baseText && hasDocumentWithoutText && !hasExtractedAttachmentText) {
+      promptBody =
+        `${attachmentPolicy}\n\n` +
+        `The user clicked Ask AI on a document-like attachment, but no text was extracted.\n` +
+        `Do not describe the image generically unless explicitly asked.\n` +
+        `Instead, explain that text extraction was unavailable and suggest re-uploading a clearer image or using a PDF/text source.\n\n` +
+        `${attachmentTextBlock}${attachmentMetaBlock}`.trim();
     }
-  };
+
+    if (!promptBody && attachments.length > 0) {
+      promptBody =
+        `A user uploaded file(s) to a chat message, but plain text content was not extracted.\n` +
+        `${attachmentMetaBlock}\n\nReply with:\n` +
+        `1) A short acknowledgement\n` +
+        `2) What you can and cannot do without parsing the file contents\n` +
+        `3) Next best step\n` +
+        `4) Suggestions.`;
+    }
+
+    if (!promptBody) return;
+
+    const { prompt, history } = await buildAskAIContext({
+      scope,
+      messages,
+      targetMessage: msg,
+      promptBody,
+      decryptForAI: allowAIDecrypt,
+    });
+
+    console.log("ASK AI DEBUG", {
+      scope,
+      attachments,
+      prompt,
+      history,
+    });
+
+    const aiText = await callGeminiAPI(prompt, selectedModel, history);
+
+    const messagesRef = collection(
+      db,
+      "Hive",
+      hiveID,
+      "Honeycomb",
+      honeycombID,
+      "messages"
+    );
+
+    await addDoc(messagesRef, {
+      type: "text",
+      text: aiText,
+      attachment: null,
+      sender: "AI Bot",
+      senderId: "AI",
+      timestamp: serverTimestamp(),
+    });
+  } catch (err) {
+    console.error("AI request failed:", err);
+  } finally {
+    setLoadingAI(false);
+  }
+};
 
   /* ----------------- CREATE TASK FROM MESSAGE ----------------- */
   const openCreateTask = (msg) => {
@@ -970,10 +776,7 @@ Do not invent past decisions or citations.`;
     checklist,
     status,
     priority,
-    blockReason,
     dueAt,
-    assignees,
-    linkedDecisionId,
   }) => {
     const msg = taskSourceMsg;
     if (!msg) return;
@@ -981,24 +784,6 @@ Do not invent past decisions or citations.`;
     try {
       const arr = normalizeAttachments(msg);
       const firstTextAttachment = arr.find((x) => x?.text);
-      const linkedFiles = arr.map((file) => ({
-        name: file.name || "file",
-        url: file.url || "",
-        contentType: file.contentType || "unknown",
-        size: file.size || 0,
-      }));
-      const inferredDecision =
-        decisionRecords.find(
-          (record) =>
-            String(record.source?.parentMessageID || record.parentMessageID || "") ===
-              String(msg.id) &&
-            String(record.source?.honeycombID || record.honeycombID || "") ===
-              String(honeycombID)
-        ) || null;
-      const linkedDecision =
-        decisionRecords.find((record) => String(record.id) === String(linkedDecisionId || "")) ||
-        inferredDecision ||
-        null;
 
       const combinedDescription = firstTextAttachment?.text
         ? `${description}\n\n[Attachment: ${firstTextAttachment.name || "file.txt"}]\n${firstTextAttachment.text}`
@@ -1013,20 +798,9 @@ Do not invent past decisions or citations.`;
         checklist,
         status,
         priority,
-        blockReason,
-        assignees: Array.isArray(assignees) ? assignees : [],
+        assignees: [],
         dueAt,
         createdBy: user.uid,
-        linkedDecisionId: linkedDecision?.id || "",
-        linkedDecisionTitle: linkedDecision?.title || "",
-        linkedFiles,
-        sourceThreadID: linkedDecision?.threadID || "",
-        sourceDecisionID: linkedDecision?.id || "",
-        sourcePreview: {
-          parentMessageText: msg.text || "",
-          decisionTitle: linkedDecision?.title || "",
-          decisionSummary: linkedDecision?.summary || linkedDecision?.decision || "",
-        },
       });
 
       setTaskModalOpen(false);
@@ -1037,75 +811,9 @@ Do not invent past decisions or citations.`;
     }
   };
 
-  const openDecisionLogger = (msg) => {
-    if (!msg?.id || msg.senderId === "AI") return;
-    setDecisionSourceMsg(msg);
-    setDecisionModalOpen(true);
-  };
-
-  const saveLoggedDecision = async ({
-    title,
-    summary,
-    rationale,
-    decision,
-    status,
-    supersedesDecisionId,
-  }) => {
-    const msg = decisionSourceMsg;
-    if (!msg?.id) return;
-
-    const existingDecision = decisionRecords.find(
-      (record) =>
-        String(record.source?.parentMessageID || record.parentMessageID || "") ===
-          String(msg.id) &&
-        String(record.source?.honeycombID || record.honeycombID || "") ===
-          String(honeycombID)
-    );
-
-    if (existingDecision) {
-      return;
-    }
-
-    try {
-      setLoggingDecisionId(msg.id);
-
-      await createDecisionRecord({
-        hiveID,
-        decisionID: `manual-${msg.id}`,
-        title: title || firstMeaningfulLine(msg.text, "Logged decision"),
-        summary: summary || truncateText(msg.text, 220),
-        rationale:
-          rationale || "Logged directly from a chat message for easier traceability.",
-        decision: decision || String(msg.text || "").trim() || "Decision logged from chat.",
-        status: status || DECISION_STATUSES.ACTIVE,
-        supersedesDecisionId: supersedesDecisionId || "",
-        honeycombID,
-        parentMessageID: msg.id,
-        threadID: `manual-${msg.id}`,
-        ownerUserId: msg.senderId || null,
-        ownerDisplayName: msg.sender || null,
-        createdByUserId: user?.uid || null,
-        createdByDisplayName: user?.displayName || user?.email || null,
-        generatedBy: "inline-log",
-        source: {
-          hiveID,
-          honeycombID,
-          parentMessageID: msg.id,
-          threadID: `manual-${msg.id}`,
-        },
-      });
-    } catch (error) {
-      console.error("Failed to log decision from message:", error);
-      alert("Could not log the decision right now.");
-    } finally {
-      setLoggingDecisionId("");
-    }
-  };
-
   /* ----------------- OPEN THREAD ----------------- */
   const handleOpenThread = useCallback(
     async (messageID) => {
-      setActiveSubtab("chat");
       setActiveThreadMessageID(messageID);
 
       try {
@@ -1138,19 +846,6 @@ Do not invent past decisions or citations.`;
     },
     [hiveID, honeycombID, user]
   );
-
-  useEffect(() => {
-    requestedThreadHandledRef.current = false;
-  }, [requestedThreadMessageID]);
-
-  useEffect(() => {
-    if (!requestedThreadMessageID || requestedThreadHandledRef.current) return;
-    const exists = messages.some((msg) => msg.id === requestedThreadMessageID);
-    if (!exists) return;
-
-    requestedThreadHandledRef.current = true;
-    handleOpenThread(requestedThreadMessageID);
-  }, [requestedThreadMessageID, messages, handleOpenThread]);
 
   /* ----------------- RENDER MESSAGE TEXT ----------------- */
   const renderMessageText = (text, senderId = null) => {
@@ -1196,11 +891,11 @@ Do not invent past decisions or citations.`;
         return (
           <div
             key={`text-${idx}`}
-            className="mb-3 rounded-2xl border border-white/8 bg-white/6 p-4 text-sm leading-relaxed font-medium text-slate-100"
+            className="mb-3 text-sm text-gray-800 leading-relaxed font-medium"
           >
-            <ul className="ml-1 list-disc list-inside space-y-2">
+            <ul className="list-disc list-inside space-y-2 ml-1">
               {items.map((it, i2) => (
-                <li key={i2} className="text-sm text-slate-100">
+                <li key={i2} className="text-sm text-gray-800">
                   {it}
                 </li>
               ))}
@@ -1212,10 +907,10 @@ Do not invent past decisions or citations.`;
       return (
         <div
           key={`text-${idx}`}
-          className={`mb-4 whitespace-pre-wrap rounded-2xl border p-4 text-base font-semibold leading-relaxed ${
+          className={`text-base text-gray-700 whitespace-pre-wrap leading-relaxed mb-4 font-bold p-3 rounded-lg border-l-4 ${
             isAI
-              ? "border-cyan-300/20 bg-cyan-300/10 text-cyan-50"
-              : "border-amber-200/20 bg-amber-200/10 text-slate-50"
+              ? "bg-gradient-to-r from-blue-50 to-transparent border-blue-400"
+              : "bg-gradient-to-r from-yellow-50 to-transparent border-yellow-400"
           }`}
         >
           {part}
@@ -1233,28 +928,6 @@ Do not invent past decisions or citations.`;
     );
   });
 
-  const incidentSignal =
-    [...messages]
-      .reverse()
-      .find((chatMessage) => matchesIncident(chatMessage.text)) || null;
-
-  const activeNowCount = new Set(
-    messages
-      .slice(-12)
-      .map((chatMessage) => chatMessage.senderId)
-      .filter((senderId) => senderId && senderId !== "AI")
-  ).size;
-
-  const sortedMembers = [...memberDirectory].sort((left, right) => {
-    const rank = { OWNER: 0, ADMIN: 1, MEMBER: 2, VIEWER: 3 };
-    const leftRank = rank[left.role] ?? 4;
-    const rightRank = rank[right.role] ?? 4;
-    if (leftRank !== rightRank) return leftRank - rightRank;
-    return String(left.displayName || left.email || left.uid).localeCompare(
-      String(right.displayName || right.email || right.uid)
-    );
-  });
-
   if (loading) return <p className="p-4 text-center">Loading user info...</p>;
 
   if (!user) {
@@ -1267,89 +940,39 @@ Do not invent past decisions or citations.`;
     const arr = a ? (Array.isArray(a) ? a : [a]) : [];
     return arr.find((x) => x?.text)?.text || "";
   })();
-  const taskSourceDecision =
-    decisionRecords.find(
-      (record) =>
-        String(record.source?.parentMessageID || record.parentMessageID || "") ===
-          String(taskSourceMsg?.id || "") &&
-        String(record.source?.honeycombID || record.honeycombID || "") ===
-          String(honeycombID)
-    ) || null;
 
-  // ✅ HERE is sendDisabled (right before return)
+  
   const sendDisabled =
-    !canChat || (!message.trim() && pendingAttachments.length === 0);
-  const participantCount = Object.keys(userRoles).length;
-  const hiveLabel = String(hiveMeta?.name || hiveID);
-  const roomLabel = String(roomMeta?.displayName || roomMeta?.name || honeycombID);
-  const permissionLabel = toTitleCase(userRole || "viewer");
-  const roomDecisionRecords = decisionRecords.filter((record) => {
-    return (
-      String(record.honeycombID || record.source?.honeycombID || "") ===
-      String(honeycombID)
-    );
-  });
-  const roomTaskRecords = taskRecords.filter((task) => {
-    return String(task.source?.honeycombID || "") === String(honeycombID);
-  });
-  const roomDecisionCount = roomDecisionRecords.length;
-  const openRoomTaskCount = roomTaskRecords.filter((task) => {
-    const status = String(task.status || "todo").toLowerCase();
-    return !CLOSED_TASK_STATUSES.has(status);
-  }).length;
-  const roomFiles = messages.flatMap((chatMessage) =>
-    normalizeAttachments(chatMessage).map((file, index) => ({
-      id: `${chatMessage.id}-${index}`,
-      file,
-      messageId: chatMessage.id,
-      sender: chatMessage.sender || "User",
-      timestamp: chatMessage.timestamp,
-      text: chatMessage.text || "",
-    }))
-  );
+  !canChat ||
+  uploadingAttachment ||
+  (!message.trim() && pendingAttachments.length === 0);
 
   return (
-    <div className="page-shell">
-      <div className="page-frame">
-        <div
-          className={`flex min-h-[calc(100vh-2rem)] flex-col gap-4 ${
-            activeThreadMessageID ? "xl:pr-[26rem]" : ""
-          }`}
-        >
-          <header className="hero-panel relative z-10">
-          <div className="chat-header mb-6">
-            <div className="space-y-4">
-              <span className="hero-chip">Honeycomb conversation</span>
-              <p className="text-kicker">Active room</p>
-            <h1 className="relative max-w-5xl break-words text-[clamp(2.1rem,4.5vw,4.25rem)] font-semibold leading-[1.02] tracking-[-0.05em] text-transparent">
-              <span className="pointer-events-none absolute inset-0 text-white">
-                {roomLabel} / {hiveLabel}
-              </span>
+    <div className="flex h-screen bg-yellow-50">
+      <div className="flex-1 flex flex-col">
+        {/* Header with Search */}
+        <header className="p-4 bg-yellow-500 text-white border-b border-yellow-700 relative z-10">
+          <div className="flex justify-between items-center mb-3">
+            <h1 className="font-bold text-lg flex items-center gap-2">
               🐝 {hiveID} / {honeycombID}
               {unreadMessageCount > 0 && (
                 <span
-                  className="ml-3 inline-flex rounded-full border border-rose-300/20 bg-rose-300/15 px-3 py-1 align-middle text-xs font-semibold uppercase tracking-[0.16em] text-rose-100"
+                  className="ml-2 px-2 py-0.5 bg-red-600 text-white text-xs font-semibold rounded-full"
                   title={`${unreadMessageCount} unread message${
                     unreadMessageCount > 1 ? "s" : ""
                   }`}
                 >
-                  {unreadMessageCount} unread
+                  {unreadMessageCount}
                 </span>
               )}
-              </h1>
-              <div className="action-row">
-                <span className="status-pill">#{roomLabel}</span>
-                <span className="status-pill">{permissionLabel}</span>
-                <span className="status-pill">{canChat ? "Can contribute" : "View only"}</span>
-              </div>
-            </div>
+            </h1>
 
             <button
               onClick={() => router.push(`/hive/${hiveID}`)}
-              className="button-ghost"
+              className="bg-white text-yellow-500 px-3 py-1 rounded hover:bg-gray-100 border border-yellow-700"
               type="button"
             >
-              Back to hive
+              Back to Hive
             </button>
           </div>
 
@@ -1359,10 +982,10 @@ Do not invent past decisions or citations.`;
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search messages and users..."
-              className="input-shell pl-10 pr-10"
+              className="w-full px-4 py-2 pl-10 pr-10 rounded-lg text-gray-800 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-white focus:border-white"
             />
             <svg
-              className="pointer-events-none absolute left-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400"
+              className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
@@ -1378,7 +1001,7 @@ Do not invent past decisions or citations.`;
             {searchQuery && (
               <button
                 onClick={() => setSearchQuery("")}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 transition hover:text-white"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
                 type="button"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1389,61 +1012,21 @@ Do not invent past decisions or citations.`;
           </div>
 
           {searchQuery && (
-            <p className="mt-3 text-xs uppercase tracking-[0.16em] text-slate-300/70">
+            <p className="text-xs mt-2 text-yellow-100">
               Found {filteredMessages.length} message
               {filteredMessages.length !== 1 ? "s" : ""}
             </p>
           )}
-
-          {incidentSignal && (
-            <div className="mt-4 rounded-[1.2rem] border border-rose-300/25 bg-rose-300/12 p-4">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="text-xs uppercase tracking-[0.16em] text-rose-100/75">
-                    Active incident detected
-                  </div>
-                  <p className="mt-2 text-sm leading-7 text-rose-50">
-                    {truncateText(incidentSignal.text, 100)}
-                  </p>
-                </div>
-
-                <button
-                  type="button"
-                  className="button-danger"
-                  onClick={() => handleOpenThread(incidentSignal.id)}
-                >
-                  Open war room
-                </button>
-              </div>
-            </div>
-          )}
-
-          <div className="tab-row mt-5">
-            {ROOM_TABS.map((tab) => (
-              <button
-                key={tab.id}
-                type="button"
-                className={`tab-button ${activeSubtab === tab.id ? "active" : ""}`}
-                onClick={() => setActiveSubtab(tab.id)}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
         </header>
 
-        <div className="honeycomb-room-grid">
-          <div className="space-y-4">
-        {activeSubtab === "chat" ? (
-          <>
         {/* Main feed */}
-        <main className="chat-feed flex-1 space-y-6">
+        <main className="flex-1 overflow-y-auto p-4 space-y-3">
           {hasMoreMessages && messages.length > 0 && !searchQuery && (
-            <div className="mb-4 flex justify-center">
+            <div className="flex justify-center mb-4">
               <button
                 onClick={handleLoadOlderMessages}
                 disabled={loadingOlderMessages}
-                className="button-secondary"
+                className="bg-gradient-to-r from-blue-500 to-indigo-600 text-white px-6 py-2 rounded-lg font-semibold hover:from-blue-600 hover:to-indigo-700 transition-all duration-200 flex items-center gap-2 shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
                 type="button"
               >
                 {loadingOlderMessages ? (
@@ -1464,12 +1047,12 @@ Do not invent past decisions or citations.`;
           )}
 
           {filteredMessages.length === 0 && searchQuery ? (
-            <div className="empty-state flex h-64 flex-col items-center justify-center">
+            <div className="flex flex-col items-center justify-center h-64 text-gray-500">
               <svg className="w-16 h-16 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
               </svg>
-              <p className="text-lg font-semibold text-white">No messages found</p>
-              <p className="text-sm text-slate-300">Try a different search term</p>
+              <p className="text-lg font-semibold">No messages found</p>
+              <p className="text-sm">Try a different search term</p>
             </div>
           ) : null}
 
@@ -1477,53 +1060,35 @@ Do not invent past decisions or citations.`;
             const attachments = normalizeAttachments(m);
             const threadUnread = unreadThreads[m.id] || 0;
             const threadStatus = threads[m.id]?.[0]?.status || "open";
-            const loggedDecision =
-              decisionRecords.find(
-                (record) =>
-                  String(record.source?.parentMessageID || record.parentMessageID || "") ===
-                    String(m.id) &&
-                  String(record.source?.honeycombID || record.honeycombID || "") ===
-                    String(honeycombID)
-              ) || null;
-            const codeAwareMessage =
-              hasCodeBlock(m.text) || looksLikeStackTrace(m.text) || looksLikeDiff(m.text);
 
             return (
               <div
                 id={`message-${m.id}`}
                 key={m.id}
-                className={`relative max-w-[46rem] rounded-[1.5rem] border p-4 shadow-lg shadow-slate-950/20 transition-transform duration-200 hover:-translate-y-0.5 ${
+                className={`relative p-3 rounded-lg border-l-4 ${
                   m.senderId === "AI"
-                    ? "w-full border-cyan-300/20 bg-gradient-to-br from-cyan-300/12 to-slate-900/70"
-                    : `${getUserColor(m.senderId)} w-full ${
+                    ? "bg-gradient-to-r from-indigo-50 to-purple-50 border-indigo-500 w-full sm:w-3/4 lg:w-1/2"
+                    : `${getUserColor(m.senderId)} w-full sm:w-3/4 lg:w-1/2 ${
                         m.senderId === user.uid ? "ml-auto" : ""
                       }`
                 }`}
               >
                 {threadUnread > 0 && (
                   <span
-                    className="absolute -right-2 -top-2 rounded-full bg-cyan-400 px-2.5 py-1 text-xs font-bold text-slate-950 shadow-lg"
+                    className="absolute -top-2 -right-2 px-2 py-0.5 bg-blue-600 text-white text-xs rounded-full shadow"
                     title={`${threadUnread} unread thread message${threadUnread > 1 ? "s" : ""}`}
                   >
                     {threadUnread}
                   </span>
                 )}
 
-                <div className="mb-3 flex items-center gap-2">
-                  <p className="text-sm font-bold text-white">
+                <div className="flex items-center gap-2 mb-1">
+                  <p className="text-sm font-bold text-gray-800">
                     {m.senderId === "AI" ? "🤖 " : ""}
                     {m.sender}
                   </p>
-                  {m.senderId === "AI" ? (
-                    <>
-                      <span className="status-pill bg-violet-300/15 text-violet-100">AI</span>
-                      <span className="status-pill bg-emerald-300/12 text-emerald-100">
-                        memory-enabled
-                      </span>
-                    </>
-                  ) : null}
                   {m.senderId !== "AI" && userRoles[m.senderId] && (
-                    <span className="text-xs text-slate-300" title={userRoles[m.senderId]}>
+                    <span className="text-xs" title={userRoles[m.senderId]}>
                       {getRoleEmoji(userRoles[m.senderId])}
                     </span>
                   )}
@@ -1533,8 +1098,8 @@ Do not invent past decisions or citations.`;
 
                 {/*  Attachments displayed ONCE */}
                 {attachments.length > 0 && (
-                  <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 p-3">
-                    <div className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-slate-300">
+                  <div className="mt-2">
+                    <div className="text-xs font-semibold text-gray-700 mb-1">
                       📎 {attachments.length} attachment{attachments.length !== 1 ? "s" : ""}
                     </div>
                     <AttachmentList attachments={attachments} />
@@ -1542,119 +1107,97 @@ Do not invent past decisions or citations.`;
                 )}
 
                 {Array.isArray(m.linkedTaskIds) && m.linkedTaskIds.length > 0 && (
-                  <div className="mt-3 text-xs font-semibold uppercase tracking-[0.16em] text-emerald-200">
+                  <div className="mt-1 text-xs text-green-700 font-semibold">
                     ✅ Task created ({m.linkedTaskIds.length})
                   </div>
                 )}
 
-                <div className="mt-4 flex flex-wrap gap-2">
-                    {m.senderId !== "AI" && (
-                    <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/30 p-3">
-                      
+                <div className="flex flex-col sm:flex-row sm:space-x-3 space-y-2 sm:space-y-0 mt-2">
+                    {m.senderId === user.uid && (
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {/* Model picker */}
+                      <select
+                        value={selectedModel}
+                        onChange={(e) => setSelectedModel(e.target.value)}
+                        className="text-sm p-1 border border-gray-300 rounded bg-white text-gray-800 min-w-[10rem]"
+                        title="Model"
+                        aria-label="Choose AI model"
+                      >
+                        <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                        <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+                        <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                      </select>
 
+                      {/* NEW: scope picker */}
+                      <select
+                        value={aiScope}
+                        onChange={(e) => setAiScope(e.target.value)}
+                        className="text-xs sm:text-sm p-1 border border-gray-300 rounded bg-white text-gray-800 min-w-[9rem]"
+                        title="How much chat context to send to AI"
+                        aria-label="Ask AI context scope"
+                      >
+                        <option value="message">This message only</option>
+                        <option value="last_2">Last 2 messages</option>
+                        <option value="last_3">Last 3 messages</option>
+                        <option value="last_5">Last 5 messages</option>
+                        <option value="last_20">Last 20 messages</option>
+                        <option value="entire_chat">Entire chat</option>
+                      </select>
+
+                      {/* Ask AI uses the selected scope */}
                       <button
-                        className="button-secondary"
+                        className="text-xs sm:text-sm bg-blue-600 text-white px-3 py-1.5 sm:py-1 rounded hover:bg-blue-700 shadow disabled:opacity-50"
                         onClick={() => handleAIReply(m, aiScope)}
                         disabled={loadingAI || !canChat}
                         aria-disabled={loadingAI || !canChat}
                         type="button"
                       >
-                        {loadingAI ? "Thinking..." : "Ask AI"}
+                        {loadingAI ? "Thinking..." : "Ask AI 🤖"}
                       </button>
 
                       <button
-                        className="button-primary"
+                        className={`text-xs sm:text-sm px-3 py-1.5 sm:py-1 rounded border shadow ${
+                          allowAIDecrypt
+                            ? "bg-amber-100 border-amber-400 text-amber-900"
+                            : "bg-white border-gray-300 text-gray-700 hover:bg-gray-50"
+                        }`}
+                        onClick={() => setAllowAIDecrypt((prev) => !prev)}
+                        disabled={!canChat}
+                        type="button"
+                        title="Allow AI to reverse protected values for this request"
+                      >
+                        {allowAIDecrypt ? "Decrypt for AI: On" : "Decrypt for AI"}
+                      </button>
+
+                      <button
+                        className="text-xs sm:text-sm bg-green-600 text-white px-3 py-1.5 sm:py-1 rounded hover:bg-green-700 shadow disabled:opacity-50"
                         onClick={() => openCreateTask(m)}
                         disabled={!canChat}
                         type="button"
                       >
-                        Create task
+                        Create Task ✅
                       </button>
                     </div>
                   )}
 
                   <button
-                    className={`button-ghost text-xs sm:text-sm ${
+                    className={`text-xs sm:text-sm px-3 py-1.5 sm:py-1 rounded border font-semibold ${
                       threadStatus === "closed"
-                        ? "border-rose-300/25 text-rose-100"
+                        ? "bg-red-100 border-red-400 text-red-800"
                         : threads[m.id]?.length > 0
-                        ? "border-white/16 text-white"
-                        : "border-amber-300/25 text-amber-100"
+                        ? "bg-white border-gray-300 text-gray-800"
+                        : "bg-yellow-100 border-yellow-400 text-yellow-800"
                     }`}
                     onClick={() => handleOpenThread(m.id)}
                     type="button"
                   >
-                    Reply
+                    {threadStatus === "closed"
+                      ? "Closed Thread"
+                      : threads[m.id]?.length > 0
+                      ? "View Thread"
+                      : "Start Thread"}
                   </button>
-
-                  {m.senderId !== "AI" && (
-                    <button
-                      className="button-ghost text-xs sm:text-sm"
-                      onClick={() => openDecisionLogger(m)}
-                      disabled={!canChat || loggingDecisionId === m.id || Boolean(loggedDecision)}
-                      type="button"
-                    >
-                      {loggedDecision
-                        ? "Decision logged"
-                        : loggingDecisionId === m.id
-                        ? "Logging..."
-                        : "Log decision"}
-                    </button>
-                  )}
                 </div>
-
-                {m.senderId !== "AI" && codeAwareMessage ? (
-                  <div className="mt-3 flex flex-wrap items-center gap-2 rounded-2xl border border-violet-300/18 bg-violet-300/10 p-3">
-                    <span className="text-xs font-semibold uppercase tracking-[0.16em] text-violet-100">
-                      Code Copilot
-                    </span>
-                    <button
-                      className="button-ghost text-xs sm:text-sm"
-                      onClick={() =>
-                        handleAIReply(
-                          { ...m, text: buildCodeCopilotPrompt("explain", m.text) },
-                          "message"
-                        )
-                      }
-                      disabled={loadingAI || !canChat}
-                      type="button"
-                    >
-                      Explain this
-                    </button>
-                    <button
-                      className="button-ghost text-xs sm:text-sm"
-                      onClick={() =>
-                        handleAIReply(
-                          {
-                            ...m,
-                            text: buildCodeCopilotPrompt(
-                              looksLikeStackTrace(m.text) ? "debug" : "review",
-                              m.text
-                            ),
-                          },
-                          "message"
-                        )
-                      }
-                      disabled={loadingAI || !canChat}
-                      type="button"
-                    >
-                      {looksLikeStackTrace(m.text) ? "Debug this" : "Review this"}
-                    </button>
-                    <button
-                      className="button-ghost text-xs sm:text-sm"
-                      onClick={() =>
-                        handleAIReply(
-                          { ...m, text: buildCodeCopilotPrompt("suggest_fix", m.text) },
-                          "message"
-                        )
-                      }
-                      disabled={loadingAI || !canChat}
-                      type="button"
-                    >
-                      Suggest fix
-                    </button>
-                  </div>
-                ) : null}
               </div>
             );
           })}
@@ -1665,19 +1208,19 @@ Do not invent past decisions or citations.`;
         {/* Composer */}
         <form
           onSubmit={handleSendMessage}
-          className="chat-composer flex flex-col gap-3 p-4"
+          className="p-2 sm:p-4 flex flex-col gap-2 bg-white border-t border-gray-300"
         >
           {/* ✅ Pending attachment queue UI */}
           {pendingAttachments.length > 0 && (
-            <div className="w-full rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-3">
-              <div className="mb-2 flex items-center justify-between">
-                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-100">
+            <div className="w-full p-2 rounded-lg border border-blue-200 bg-blue-50">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs font-semibold text-blue-800">
                   📎 Ready to send ({pendingAttachments.length})
                 </p>
 
                 <button
                   type="button"
-                  className="text-xs font-semibold text-cyan-100 underline transition hover:text-white"
+                  className="text-xs text-blue-700 underline hover:text-blue-900"
                   onClick={() => setPendingAttachments([])}
                 >
                   Clear
@@ -1688,15 +1231,15 @@ Do not invent past decisions or citations.`;
                 {pendingAttachments.map((a, idx) => (
                   <div
                     key={`${a?.url || a?.name || "file"}-${idx}`}
-                    className="flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2"
+                    className="flex items-center gap-2 px-2 py-1 rounded bg-white border border-blue-200"
                   >
-                    <span className="max-w-[240px] break-all text-xs text-slate-100">
+                    <span className="text-xs text-gray-800 break-all max-w-[240px]">
                       {a?.name || "file"}
                     </span>
 
                     <button
                       type="button"
-                      className="text-xs text-rose-200 transition hover:text-rose-100"
+                      className="text-xs text-red-600 hover:text-red-800"
                       onClick={() =>
                         setPendingAttachments((prev) =>
                           prev.filter((_, i) => i !== idx)
@@ -1710,16 +1253,16 @@ Do not invent past decisions or citations.`;
                 ))}
               </div>
 
-              <p className="mt-2 text-[11px] text-cyan-100/80">
+              <p className="text-[11px] text-blue-700 mt-2">
                 Uploads are queued. Click <b>Send</b> to post them to the chat.
               </p>
             </div>
           )}
 
-          <div className="flex flex-col gap-3 lg:flex-row">
-            <div className="relative flex-1">
+          <div className="flex gap-2">
+            <div className="flex-1 relative">
               <input
-                className="input-shell pr-12"
+                className="w-full border border-gray-400 rounded-lg p-2 pr-12 text-sm sm:text-base text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400"
                 placeholder={canChat ? "Type or use voice..." : "View-only access"}
                 value={message}
                 onChange={(e) => setMessage(e.target.value)}
@@ -1730,10 +1273,10 @@ Do not invent past decisions or citations.`;
                 <button
                   type="button"
                   onClick={toggleVoiceRecording}
-                  className={`absolute right-3 top-1/2 -translate-y-1/2 rounded-full p-2 transition ${
+                  className={`absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg transition-all duration-200 ${
                     isRecording
-                      ? "bg-rose-500 text-white shadow-lg shadow-rose-500/20"
-                      : "bg-cyan-300/12 text-cyan-100 hover:bg-cyan-300/20"
+                      ? "bg-red-500 text-white animate-pulse"
+                      : "bg-blue-100 text-blue-600 hover:bg-blue-200"
                   }`}
                   title={isRecording ? "Stop recording" : "Start voice input"}
                 >
@@ -1748,280 +1291,41 @@ Do not invent past decisions or citations.`;
               )}
             </div>
 
-            <div className="flex flex-wrap gap-3">
-              {canChat && (
-                <FileUploader
-                  hiveID={hiveID}
-                  honeycombID={honeycombID}
-                  userId={user.uid}
-                  onUploaded={handleFileUploaded}
+            {canChat && (
+            <FileUploader
+              hiveID={hiveID}
+              honeycombID={honeycombID}
+              userId={user.uid}
+              onUploaded={handleFileUploaded}
+              onUploadStateChange={setUploadingAttachment}
+            />
+          )}
+
+            <button
+              type="submit"
+              disabled={sendDisabled}
+              className="bg-yellow-400 px-3 sm:px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700 flex items-center gap-2 disabled:opacity-50"
+              title={uploadingAttachment ? "Wait for upload to finish" : "Send"}
+            >
+              <span className="hidden sm:inline">
+                {uploadingAttachment ? "Uploading..." : "Send"}
+              </span>
+              <svg
+                className="w-5 h-5 sm:hidden"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
                 />
-              )}
-
-              <button
-                type="button"
-                disabled={sendDisabled || loadingAI}
-                className="button-secondary"
-                onClick={() =>
-                  handleAIReply({ text: message, attachment: pendingAttachments }, aiScope)
-                }
-              >
-                {loadingAI ? "Thinking..." : "Ask AI"}
-              </button>
-
-              <button
-                type="submit"
-                disabled={sendDisabled}
-                className="button-primary min-w-[8rem]"
-              >
-                Send
-              </button>
-            </div>
+              </svg>
+            </button>
           </div>
-
-          <p className="text-xs uppercase tracking-[0.16em] text-slate-300/55">
-            AI replies use recent room context and include a citation when they pull from past decisions.
-          </p>
         </form>
-          </>
-        ) : activeSubtab === "decisions" ? (
-          <section className="glass-panel space-y-4">
-            <div className="chat-header">
-              <div>
-                <p className="text-kicker">Room decisions</p>
-                <h2 className="panel-title text-2xl">Decisions from {roomLabel}</h2>
-              </div>
-              <span className="status-pill">
-                {roomDecisionCount === 1 ? "1 decision" : `${roomDecisionCount} decisions`}
-              </span>
-            </div>
-
-            {roomDecisionRecords.length ? (
-              <div className="space-y-3">
-                {roomDecisionRecords.map((decision) => (
-                  <article key={decision.id} className="surface-card">
-                    <div className="surface-card-inner space-y-3">
-                      <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div>
-                          <div className="panel-title">
-                            {decision.title || "Decision Record"}
-                          </div>
-                          <div className="panel-subtitle">
-                            {decision.ownerDisplayName || decision.createdByDisplayName || "Team"} |{" "}
-                            {formatStamp(decision.updatedAt || decision.createdAt || decision.closedAt)}
-                          </div>
-                        </div>
-                        <span className="status-pill">
-                          {(Array.isArray(decision.tags) && decision.tags[0]) ||
-                            decision.status ||
-                            "Decision"}
-                        </span>
-                      </div>
-                      <p className="text-sm leading-7 text-slate-100">
-                        {decision.summary || decision.decision || "No summary stored yet."}
-                      </p>
-                      {decision.parentMessageID || decision.source?.parentMessageID ? (
-                        <button
-                          type="button"
-                          className="workspace-inline-link"
-                          onClick={() => {
-                            setActiveSubtab("chat");
-                            handleOpenThread(
-                              decision.source?.parentMessageID || decision.parentMessageID
-                            );
-                          }}
-                        >
-                          Open source chat
-                        </button>
-                      ) : null}
-                    </div>
-                  </article>
-                ))}
-              </div>
-            ) : (
-              <div className="empty-state">
-                No decision records have been logged from this room yet.
-              </div>
-            )}
-          </section>
-        ) : activeSubtab === "tasks" ? (
-          <section className="glass-panel space-y-4">
-            <div className="chat-header">
-              <div>
-                <p className="text-kicker">Room tasks</p>
-                <h2 className="panel-title text-2xl">Tasks created from {roomLabel}</h2>
-              </div>
-              <span className="status-pill">
-                {roomTaskRecords.length === 1 ? "1 task" : `${roomTaskRecords.length} tasks`}
-              </span>
-            </div>
-
-            {roomTaskRecords.length ? (
-              <div className="space-y-3">
-                {roomTaskRecords.map((task) => (
-                  <article key={task.id} className="surface-card">
-                    <div className="surface-card-inner space-y-3">
-                      <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div>
-                          <div className="panel-title">{task.title || "Untitled task"}</div>
-                          <div className="panel-subtitle">
-                            {task.priority || "medium"} priority | {task.status || "todo"}
-                          </div>
-                        </div>
-                        <span className="status-pill">
-                          {task.linkedDecisionTitle || "Room task"}
-                        </span>
-                      </div>
-                      <p className="text-sm leading-7 text-slate-100">
-                        {task.description || "No description yet."}
-                      </p>
-                      <div className="flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          className="workspace-inline-link"
-                          onClick={() => {
-                            setActiveSubtab("chat");
-                            handleOpenThread(task.source?.messageID);
-                          }}
-                          disabled={!task.source?.messageID}
-                        >
-                          Open source chat
-                        </button>
-                        {task.blockReason ? (
-                          <span className="status-pill bg-rose-300/12 text-rose-100">
-                            Blocked: {task.blockReason}
-                          </span>
-                        ) : null}
-                      </div>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            ) : (
-              <div className="empty-state">
-                No tasks have been created from this room yet.
-              </div>
-            )}
-          </section>
-        ) : (
-          <section className="glass-panel space-y-4">
-            <div className="chat-header">
-              <div>
-                <p className="text-kicker">Room files</p>
-                <h2 className="panel-title text-2xl">Attachments shared in {roomLabel}</h2>
-              </div>
-              <span className="status-pill">
-                {roomFiles.length === 1 ? "1 file" : `${roomFiles.length} files`}
-              </span>
-            </div>
-
-            {roomFiles.length ? (
-              <div className="space-y-3">
-                {roomFiles.map((entry) => (
-                  <article key={entry.id} className="surface-card">
-                    <div className="surface-card-inner space-y-3">
-                      <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div>
-                          <div className="panel-title">{entry.file.name || "Attachment"}</div>
-                          <div className="panel-subtitle">
-                            Shared by {entry.sender} | {formatStamp(entry.timestamp)}
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          className="workspace-inline-link"
-                          onClick={() => {
-                            setActiveSubtab("chat");
-                            handleOpenThread(entry.messageId);
-                          }}
-                        >
-                          View message
-                        </button>
-                      </div>
-                      <AttachmentList attachments={[entry.file]} />
-                      {entry.text ? (
-                        <p className="text-sm leading-7 text-slate-300">
-                          {truncateText(entry.text, 180)}
-                        </p>
-                      ) : null}
-                    </div>
-                  </article>
-                ))}
-              </div>
-            ) : (
-              <div className="empty-state">
-                No files have been shared in this room yet.
-              </div>
-            )}
-          </section>
-        )}
-          </div>
-
-          <aside className="glass-panel honeycomb-room-sidebar">
-            <div>
-              <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
-                Room stats
-              </div>
-
-              <div className="mt-4 grid gap-3">
-                <div className="metric-card">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
-                    Active now
-                  </div>
-                  <div className="mt-3 text-2xl font-semibold text-white">{activeNowCount}</div>
-                </div>
-
-                <div className="metric-card">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
-                    Open tasks
-                  </div>
-                  <div className="mt-3 text-2xl font-semibold text-white">{openRoomTaskCount}</div>
-                </div>
-
-                <div className="metric-card">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
-                    Decisions
-                  </div>
-                  <div className="mt-3 text-2xl font-semibold text-white">{roomDecisionCount}</div>
-                </div>
-
-                <div className="metric-card">
-                  <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
-                    Members
-                  </div>
-                  <div className="mt-3 text-2xl font-semibold text-white">{participantCount}</div>
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-6">
-              <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
-                Members
-              </div>
-
-              <div className="mt-4 space-y-3">
-                {sortedMembers.map((member) => (
-                  <div
-                    key={member.uid}
-                    className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-3"
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate font-medium text-white">
-                        {member.displayName || member.email || member.uid}
-                      </div>
-                      {member.email ? (
-                        <div className="truncate text-xs text-slate-300/70">{member.email}</div>
-                      ) : null}
-                    </div>
-
-                    <span className="status-pill">{member.role || "MEMBER"}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </aside>
-        </div>
-        </div>
       </div>
 
       {/* Thread Panel */}
@@ -2056,27 +1360,6 @@ Do not invent past decisions or citations.`;
         onSave={saveTask}
         messageText={taskSourceMsg?.text || ""}
         attachmentText={modalAttachmentText}
-        members={sortedMembers}
-        decisionOptions={decisionRecords}
-        initialDecisionId={taskSourceDecision?.id || ""}
-        titleOverride="Create task from message"
-        subtitleOverride="Turn this chat context into tracked work, assign owners, and keep it connected to the decision trail."
-        submitLabel="Create task"
-      />
-
-      <LogDecisionModal
-        open={decisionModalOpen}
-        onClose={() => {
-          setDecisionModalOpen(false);
-          setDecisionSourceMsg(null);
-        }}
-        onSave={saveLoggedDecision}
-        messageText={decisionSourceMsg?.text || ""}
-        decisionOptions={decisionRecords.filter(
-          (record) =>
-            String(record.id || "") !== `manual-${decisionSourceMsg?.id || ""}` &&
-            String(record.status || "").toLowerCase() !== DECISION_STATUSES.ARCHIVED
-        )}
       />
     </div>
   );
@@ -2122,16 +1405,16 @@ function ThreadPanel({
     if (threadUserColors[userId]) return threadUserColors[userId];
 
     const colors = [
-      "border-amber-300/30 bg-amber-300/10",
-      "border-blue-300/30 bg-blue-300/10",
-      "border-emerald-300/30 bg-emerald-300/10",
-      "border-violet-300/30 bg-violet-300/10",
-      "border-pink-300/30 bg-pink-300/10",
-      "border-indigo-300/30 bg-indigo-300/10",
-      "border-orange-300/30 bg-orange-300/10",
-      "border-teal-300/30 bg-teal-300/10",
-      "border-rose-300/30 bg-rose-300/10",
-      "border-cyan-300/30 bg-cyan-300/10",
+      "border-yellow-500 bg-yellow-50",
+      "border-blue-500 bg-blue-50",
+      "border-green-500 bg-green-50",
+      "border-purple-500 bg-purple-50",
+      "border-pink-500 bg-pink-50",
+      "border-indigo-500 bg-indigo-50",
+      "border-orange-500 bg-orange-50",
+      "border-teal-500 bg-teal-50",
+      "border-red-500 bg-red-50",
+      "border-cyan-500 bg-cyan-50",
     ];
 
     const randomColor = colors[Math.floor(Math.random() * colors.length)];
@@ -2296,7 +1579,7 @@ function ThreadPanel({
   return (
     <div
       ref={panelRef}
-      className={`thread-panel-shell fixed right-0 top-0 z-50 flex h-full flex-col p-3 sm:p-4 ${
+      className={`fixed right-0 top-0 h-full bg-white border-l border-gray-300 p-2 sm:p-4 shadow-lg flex flex-col z-50 ${
         isMobile ? "left-0" : ""
       }`}
       style={isMobile ? {} : { width: `${panelWidth}px` }}
@@ -2312,23 +1595,23 @@ function ThreadPanel({
       )}
 
       <button
-        className="button-ghost mb-3 text-sm sm:text-base"
+        className="bg-yellow-400 px-3 sm:px-4 py-2 rounded-lg text-sm sm:text-base font-semibold hover:bg-yellow-500 border border-yellow-700 mb-3"
         onClick={onClose}
         type="button"
       >
         Close
       </button>
 
-      <div className="flex-1 overflow-y-auto rounded-[1.5rem] border border-white/10 bg-slate-950/30 p-4">
-        <p className="mb-3 whitespace-pre-wrap text-base font-bold leading-relaxed text-white">
+      <div className="flex-1 overflow-y-auto">
+        <p className="font-bold mb-2 text-gray-900 whitespace-pre-wrap leading-relaxed">
           {parentMessage?.text}
         </p>
 
-        <p className="mb-3 text-xs font-semibold uppercase tracking-[0.16em] text-slate-300">
+        <p className="text-xs font-semibold mb-2">
           Status:{" "}
           <span
             className={
-              threadClosed ? "font-bold text-rose-200" : "font-bold text-emerald-200"
+              threadClosed ? "text-red-600 font-bold" : "text-green-600 font-bold"
             }
           >
             {threadStatus.toUpperCase()}
@@ -2338,46 +1621,46 @@ function ThreadPanel({
         {currentThread.map((thread) => (
           <div
             key={thread.id}
-            className={`mb-3 rounded-2xl border p-3 ${
+            className={`mb-2 p-2 rounded border-l-4 ${
               thread.senderId === "AI"
-                ? "border-cyan-300/20 bg-cyan-300/10"
+                ? "bg-gradient-to-r from-indigo-50 to-purple-50 border-indigo-500"
                 : `${getThreadUserColor(thread.senderId)}`
             }`}
           >
-            <div className="mb-1 flex items-center gap-2">
-              <p className="text-xs font-semibold text-slate-100">
+            <div className="flex items-center gap-2 mb-1">
+              <p className="text-xs font-semibold text-gray-700">
                 {thread.senderId === "AI" ? "🤖 " : ""}
                 {thread.sender}
               </p>
               {thread.senderId !== "AI" && threadUserRoles[thread.senderId] && (
-                <span className="text-xs text-slate-300" title={threadUserRoles[thread.senderId]}>
+                <span className="text-xs" title={threadUserRoles[thread.senderId]}>
                   {getRoleEmoji(threadUserRoles[thread.senderId])}
                 </span>
               )}
             </div>
-            <p className="break-words whitespace-pre-wrap text-sm leading-relaxed text-slate-100">
+            <p className="text-sm text-gray-900 break-words whitespace-pre-wrap leading-relaxed">
               {thread.text}
             </p>
           </div>
         ))}
       </div>
-        <div className="mb-6 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-white shadow-lg">
+        <div className="p-4 bg-indigo-900 text-white rounded-xl shadow-lg mb-6 border-b-4 border-indigo-700">
   <h3 className="text-sm font-bold flex items-center gap-2 mb-3">🧠 Ask Hive Mind</h3>
   <input 
     value={memoryQuery} 
     onChange={(e) => setMemoryQuery(e.target.value)} 
-    className="input-shell mb-2 text-sm" 
+    className="w-full p-3 rounded text-white text-sm mb-2" 
     placeholder="Ask a previous decision..." 
   />
   <button 
     onClick={handleSearchMemory} 
     disabled={isSearchingMemory}
-    className="button-primary w-full text-xs"
+    className="w-full bg-yellow-400 hover:bg-yellow-500 text-indigo-900 font-bold py-2 rounded text-xs transition-colors"
   >
     {isSearchingMemory ? "Thinking..." : "Query Memory"}
   </button>
   {memoryResponse && (
-    <div className="mt-2 rounded-xl border border-white/10 bg-slate-950/40 p-3 text-xs text-slate-100">
+    <div className="mt-2 text-xs bg-indigo-800 p-2 rounded border border-indigo-600 animate-in fade-in">
       {memoryResponse}
     </div>
   )}
@@ -2392,10 +1675,10 @@ function ThreadPanel({
       {currentThread[0]?.senderId === user.uid && canChat && (
         <button
   onClick={handleToggleThreadStatus} // Much cleaner!
-  className={`mt-2 rounded-full px-4 py-2 font-semibold ${
+  className={`mt-2 px-4 py-2 rounded-md font-semibold ${
     threadClosed
-      ? "bg-emerald-500 text-white hover:bg-emerald-600"
-      : "bg-rose-500 text-white hover:bg-rose-600"
+      ? "bg-green-500 text-white hover:bg-green-600"
+      : "bg-red-500 text-white hover:bg-red-600"
   }`}
   type="button"
 >
@@ -2409,9 +1692,9 @@ function ThreadPanel({
             (s) => s.threadID === currentThread[0]?.id
           );
           return threadSummary ? (
-            <div className="mt-4 overflow-hidden rounded-2xl border border-white/10 bg-white/5 shadow-lg">
-              <div className="flex items-center gap-2 border-b border-white/10 bg-cyan-300/10 px-4 py-3">
-                <span className="text-2xl text-cyan-100">*</span>
+            <div className="mt-4 bg-gradient-to-br from-indigo-50 via-blue-50 to-cyan-50 border-2 border-indigo-200 rounded-2xl shadow-lg overflow-hidden">
+              <div className="bg-gradient-to-r from-indigo-600 to-blue-600 px-4 py-3 flex items-center gap-2">
+                <span className="text-2xl">✨</span>
                 <h2 className="text-base font-bold text-white">Thread Summary</h2>
               </div>
 
@@ -2430,22 +1713,22 @@ function ThreadPanel({
 
 
       {showHelp && (
-        <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-3 shadow-sm">
-          <div className="flex items-start justify-between">
-            <h3 className="text-sm font-semibold text-white">UI Guide</h3>
+        <div className="mt-4 p-3 bg-white border border-gray-200 rounded-lg shadow-sm">
+          <div className="flex justify-between items-start">
+            <h3 className="text-sm font-semibold">UI Guide</h3>
             <button
               onClick={dismissHelp}
-              className="text-xs text-slate-400 hover:text-white"
+              className="text-xs text-gray-500 hover:text-gray-800"
               title="Dismiss help"
               type="button"
             >
               Got it
             </button>
           </div>
-          <p className="mt-2 text-xs text-slate-300">
+          <p className="text-xs text-gray-600 mt-2">
             Quick orientation to the Honeycomb UI:
           </p>
-          <ul className="mt-2 list-disc list-inside space-y-1 text-xs text-slate-300">
+          <ul className="text-xs text-gray-600 mt-2 list-disc list-inside space-y-1">
             <li>
               <strong>Messages:</strong> Main feed on the left. Click
               “Start/View Thread” to open a sub-conversation.
@@ -2533,7 +1816,7 @@ function SummaryCard({
         const messageCount = threadMessages?.length || 0;
 
         return (
-          <div className="rounded-2xl border border-white/10 bg-slate-950/35 shadow-sm transition-all duration-200 hover:border-cyan-300/20 hover:shadow-lg">
+          <div className="bg-white rounded-xl border-2 border-indigo-100 shadow-sm hover:shadow-md transition-all duration-200">
             <div className="p-3 cursor-pointer" onClick={() => setExpanded(!expanded)}>
               <div className="flex items-start justify-between gap-2">
                 <div className="flex items-start gap-2 flex-1">
@@ -2547,24 +1830,24 @@ function SummaryCard({
 
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1 flex-wrap">
-                      <span className="text-xs font-semibold text-cyan-100">
+                      <span className="text-xs font-semibold text-indigo-700">
                         Thread #{String(summary.threadID || "").slice(0, 8)}
                       </span>
 
                       {messageCount > 0 && (
-                        <span className="rounded-full bg-cyan-300/12 px-2 py-0.5 text-xs font-medium text-cyan-100">
+                        <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-medium">
                           {messageCount} message{messageCount !== 1 ? "s" : ""}
                         </span>
                       )}
 
-                      <span className="text-xs text-slate-400">
+                      <span className="text-xs text-gray-500">
                         {getRelativeTime(summary.generatedAt)}
                       </span>
 
                       {summary.closedByUserName && (
-                        <span className="flex items-center gap-1 text-xs text-slate-400">
+                        <span className="text-xs text-gray-500 flex items-center gap-1">
                           by{" "}
-                          <span className="font-medium text-slate-200">
+                          <span className="font-medium text-gray-700">
                             {summary.closedByUserName}
                           </span>
                           {summary.closedByRole && (
@@ -2577,7 +1860,7 @@ function SummaryCard({
                     </div>
 
                     <p
-                      className={`text-sm leading-relaxed text-slate-100 ${
+                      className={`text-sm text-gray-700 leading-relaxed ${
                         !expanded ? "line-clamp-2" : ""
                       }`}
                     >
@@ -2587,7 +1870,7 @@ function SummaryCard({
                 </div>
 
                 <button
-                  className="flex-shrink-0 text-cyan-100 transition-transform duration-200 hover:text-white"
+                  className="flex-shrink-0 text-indigo-600 hover:text-indigo-800 transition-transform duration-200"
                   style={{ transform: expanded ? "rotate(180deg)" : "rotate(0deg)" }}
                   type="button"
                 >
@@ -2600,8 +1883,8 @@ function SummaryCard({
 
             {expanded && (
               <div className="px-3 pb-3 pt-0">
-                <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-3">
-                  <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-100">
+                <div className="bg-gradient-to-br from-gray-50 to-blue-50 p-3 rounded-lg border border-gray-200 mb-3">
+                  <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">
                     {summary.summaryText}
                   </p>
                 </div>
@@ -2609,7 +1892,7 @@ function SummaryCard({
                 <div className="flex gap-2">
                   <button
                     onClick={handleCopy}
-                    className="button-ghost flex-1 text-sm"
+                    className="flex-1 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg font-semibold text-sm hover:bg-gray-200 transition-all duration-200 flex items-center justify-center gap-2"
                     type="button"
                   >
                     {copied ? "✓ Copied!" : "📋 Copy"}
@@ -2621,7 +1904,7 @@ function SummaryCard({
                         e.stopPropagation();
                         onOpenThread && onOpenThread(summary.parentMessageID);
                       }}
-                      className="button-primary flex-1 text-sm"
+                      className="flex-1 bg-gradient-to-r from-indigo-600 to-blue-600 text-white px-4 py-2 rounded-lg font-semibold text-sm hover:from-indigo-700 hover:to-blue-700 transition-all duration-200 flex items-center justify-center gap-2 shadow-sm"
                       type="button"
                     >
                       Open Thread
@@ -2648,19 +1931,19 @@ function ThreadInput({ parentMessageID, onSend, inputRef, disabled }) {
   };
 
   return (
-    <form onSubmit={handleSubmit} className="mt-2 flex gap-2">
+    <form onSubmit={handleSubmit} className="flex mt-2">
       <input
         ref={inputRef}
         value={text}
         onChange={(e) => setText(e.target.value)}
         placeholder={disabled ? "Thread is closed or view-only" : "Reply in thread..."}
         disabled={disabled}
-        className="input-shell flex-1 text-sm"
+        className="flex-1 border border-gray-300 rounded-md p-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 disabled:bg-gray-100"
       />
       <button
         type="submit"
         disabled={disabled}
-        className="button-primary text-sm"
+        className="ml-1 px-3 py-1 bg-yellow-400 text-white rounded-md text-sm font-semibold hover:bg-yellow-500 disabled:opacity-50"
       >
         Reply
       </button>
