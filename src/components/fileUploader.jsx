@@ -1,12 +1,54 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { storage } from "@/lib/firebase/config";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 import { sanitizeImageCaption } from "@/lib/business/imageCaptionSanitizer";
 
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const MAX_STALL_MS = 20000;
+
 function safeName(name) {
   return name.replace(/[^\w.\-() ]+/g, "_");
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let index = 0;
+
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+
+  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function getFriendlyUploadError(error, file) {
+  const code = String(error?.code || "");
+  const fallback = error?.message || "Upload failed. Please try again.";
+
+  if (code === "storage/retry-limit-exceeded") {
+    return `Upload timed out. Try a smaller file than ${formatBytes(
+      file?.size || 0
+    )}, check your connection, and confirm Firebase Storage is enabled.`;
+  }
+
+  if (code === "storage/unauthorized") {
+    return "Upload blocked by Firebase Storage rules. Check storage permissions for this user.";
+  }
+
+  if (code === "storage/canceled") {
+    return "Upload was canceled before completion.";
+  }
+
+  if (code === "storage/quota-exceeded") {
+    return "Firebase Storage quota was exceeded. Try again later or use a smaller file.";
+  }
+
+  return fallback;
 }
 
 async function maybeReadText(file) {
@@ -173,14 +215,56 @@ export default function FileUploader({
   onUploadStateChange,
 }) {
   const inputRef = useRef(null);
+  const uploadTaskRef = useRef(null);
+  const stallTimerRef = useRef(null);
   const [uploading, setUploading] = useState(false);
+  const [phase, setPhase] = useState("idle");
   const [pct, setPct] = useState(0);
   const [err, setErr] = useState("");
 
-  const setBusy = (value) => {
-    setUploading(value);
-    onUploadStateChange?.(value);
+  const clearStallTimer = () => {
+    if (stallTimerRef.current) {
+      clearTimeout(stallTimerRef.current);
+      stallTimerRef.current = null;
+    }
   };
+
+  const armStallTimer = (file) => {
+    clearStallTimer();
+    stallTimerRef.current = setTimeout(() => {
+      if (uploadTaskRef.current) {
+        try {
+          uploadTaskRef.current.cancel();
+        } catch {
+          // ignore
+        }
+      }
+      setErr(
+        `Upload stalled before progress started. Try a smaller file than ${formatBytes(
+          file?.size || 0
+        )}, then retry.`
+      );
+      setBusyState({ busy: false, phase: "idle", progress: 0 });
+      if (inputRef.current) inputRef.current.value = "";
+    }, MAX_STALL_MS);
+  };
+
+  const setBusyState = ({ busy, phase: nextPhase, progress = 0 }) => {
+    setUploading(Boolean(busy));
+    setPhase(nextPhase || (busy ? "uploading" : "idle"));
+    setPct(progress);
+    onUploadStateChange?.({
+      busy: Boolean(busy),
+      phase: nextPhase || (busy ? "uploading" : "idle"),
+      progress,
+    });
+  };
+
+  useEffect(() => {
+    return () => {
+      clearStallTimer();
+    };
+  }, []);
 
   const pick = () => {
     if (!uploading) inputRef.current?.click();
@@ -196,8 +280,18 @@ export default function FileUploader({
       return;
     }
 
-    setBusy(true);
-    setPct(0);
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setErr(
+        `File too large for reliable demo upload. Please use a file under ${formatBytes(
+          MAX_UPLOAD_BYTES
+        )}.`
+      );
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+
+    setBusyState({ busy: true, phase: "uploading", progress: 0 });
+    armStallTimer(file);
 
     try {
       const fileName = `${Date.now()}_${safeName(file.name)}`;
@@ -207,20 +301,31 @@ export default function FileUploader({
       const uploadTask = uploadBytesResumable(storageRef, file, {
         contentType: file.type || "application/octet-stream",
       });
+      uploadTaskRef.current = uploadTask;
 
       uploadTask.on(
         "state_changed",
         (snap) => {
+          clearStallTimer();
           const progress = (snap.bytesTransferred / snap.totalBytes) * 100;
-          setPct(Math.round(progress));
+          setBusyState({
+            busy: true,
+            phase: "uploading",
+            progress: Math.round(progress),
+          });
         },
         (error) => {
           console.error(error);
-          setErr(error?.message || "Upload failed");
-          setBusy(false);
+          setErr(getFriendlyUploadError(error, file));
+          clearStallTimer();
+          uploadTaskRef.current = null;
+          setBusyState({ busy: false, phase: "idle", progress: 0 });
+          if (inputRef.current) inputRef.current.value = "";
         },
         async () => {
           try {
+            clearStallTimer();
+            setBusyState({ busy: true, phase: "processing", progress: 100 });
             const url = await getDownloadURL(uploadTask.snapshot.ref);
 
             const lowerName = file.name.toLowerCase();
@@ -349,16 +454,20 @@ export default function FileUploader({
             console.error(doneErr);
             setErr(doneErr?.message || "Upload finalize error");
           } finally {
-            setBusy(false);
-            setPct(0);
+            clearStallTimer();
+            uploadTaskRef.current = null;
+            setBusyState({ busy: false, phase: "idle", progress: 0 });
             if (inputRef.current) inputRef.current.value = "";
           }
         }
       );
     } catch (e2) {
       console.error(e2);
-      setErr(e2?.message || "Upload error");
-      setBusy(false);
+      setErr(getFriendlyUploadError(e2, file));
+      clearStallTimer();
+      uploadTaskRef.current = null;
+      setBusyState({ busy: false, phase: "idle", progress: 0 });
+      if (inputRef.current) inputRef.current.value = "";
     }
   };
 
@@ -376,13 +485,23 @@ export default function FileUploader({
         type="button"
         onClick={pick}
         disabled={uploading}
-        className="px-3 py-2 rounded-lg border border-gray-300 bg-white hover:bg-gray-50 disabled:opacity-50"
-        title={uploading ? "Uploading..." : "Upload file"}
+        className="rounded-xl border border-amber-200/30 bg-amber-200 px-4 py-2 font-semibold text-slate-950 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
+        title={
+          phase === "processing"
+            ? "Processing attachment..."
+            : uploading
+            ? "Uploading..."
+            : "Upload file"
+        }
       >
-        {uploading ? `Uploading ${pct}%` : "Upload"}
+        {phase === "processing"
+          ? "Processing..."
+          : uploading
+          ? `Uploading ${pct}%`
+          : "Upload"}
       </button>
 
-      {err ? <span className="text-xs text-red-600">{err}</span> : null}
+      {err ? <span className="text-xs text-rose-300">{err}</span> : null}
     </div>
   );
 }

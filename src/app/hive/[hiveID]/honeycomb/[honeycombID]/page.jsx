@@ -40,6 +40,12 @@ import AttachmentList from "@/components/attachmentList";
 import CreateTaskModal from "@/components/CreateTaskModal";
 import { createTaskFromMessage } from "@/lib/data/taskRepository";
 
+function toTitleCase(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
 
 export default function HoneycombChatPage() {
   const params = useParams();
@@ -52,7 +58,11 @@ export default function HoneycombChatPage() {
   const [message, setMessage] = useState("");
   // queued attachments (upload now, send later)
   const [pendingAttachments, setPendingAttachments] = useState([]);
-  const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [uploadState, setUploadState] = useState({
+    busy: false,
+    phase: "idle",
+    progress: 0,
+  });
 
   const [selectedModel, setSelectedModel] = useState(
     process.env.NEXT_PUBLIC_DEFAULT_MODEL ||
@@ -104,16 +114,16 @@ export default function HoneycombChatPage() {
     if (userColors[userId]) return userColors[userId];
 
     const colors = [
-      "border-yellow-500 bg-yellow-50",
-      "border-blue-500 bg-blue-50",
-      "border-green-500 bg-green-50",
-      "border-purple-500 bg-purple-50",
-      "border-pink-500 bg-pink-50",
-      "border-indigo-500 bg-indigo-50",
-      "border-orange-500 bg-orange-50",
-      "border-teal-500 bg-teal-50",
-      "border-red-500 bg-red-50",
-      "border-cyan-500 bg-cyan-50",
+      "border-amber-300/30 bg-amber-300/10",
+      "border-blue-300/30 bg-blue-300/10",
+      "border-emerald-300/30 bg-emerald-300/10",
+      "border-violet-300/30 bg-violet-300/10",
+      "border-pink-300/30 bg-pink-300/10",
+      "border-indigo-300/30 bg-indigo-300/10",
+      "border-orange-300/30 bg-orange-300/10",
+      "border-teal-300/30 bg-teal-300/10",
+      "border-rose-300/30 bg-rose-300/10",
+      "border-cyan-300/30 bg-cyan-300/10",
     ];
 
     const randomColor = colors[Math.floor(Math.random() * colors.length)];
@@ -491,7 +501,7 @@ const handleSearchMemory = async (e) => {
     return;
   }
 
-  if (uploadingAttachment) {
+  if (uploadState.busy) {
     alert("Please wait for the file upload to finish before sending.");
     return;
   }
@@ -891,11 +901,11 @@ If the attachment looks document-like but no text was extracted, say clearly tha
         return (
           <div
             key={`text-${idx}`}
-            className="mb-3 text-sm text-gray-800 leading-relaxed font-medium"
+            className="mb-3 rounded-2xl border border-white/8 bg-white/6 p-4 text-sm font-medium leading-relaxed text-slate-100"
           >
             <ul className="list-disc list-inside space-y-2 ml-1">
               {items.map((it, i2) => (
-                <li key={i2} className="text-sm text-gray-800">
+                <li key={i2} className="text-sm text-slate-100">
                   {it}
                 </li>
               ))}
@@ -907,10 +917,10 @@ If the attachment looks document-like but no text was extracted, say clearly tha
       return (
         <div
           key={`text-${idx}`}
-          className={`text-base text-gray-700 whitespace-pre-wrap leading-relaxed mb-4 font-bold p-3 rounded-lg border-l-4 ${
+          className={`mb-4 whitespace-pre-wrap rounded-2xl border p-4 text-base font-semibold leading-relaxed ${
             isAI
-              ? "bg-gradient-to-r from-blue-50 to-transparent border-blue-400"
-              : "bg-gradient-to-r from-yellow-50 to-transparent border-yellow-400"
+              ? "border-cyan-300/20 bg-cyan-300/10 text-cyan-50"
+              : "border-amber-200/20 bg-amber-200/10 text-slate-50"
           }`}
         >
           {part}
@@ -943,21 +953,30 @@ If the attachment looks document-like but no text was extracted, say clearly tha
 
   
   const sendDisabled =
-  !canChat ||
-  uploadingAttachment ||
-  (!message.trim() && pendingAttachments.length === 0);
+    !canChat ||
+    uploadState.busy ||
+    (!message.trim() && pendingAttachments.length === 0);
+  const participantCount = Object.keys(userRoles).length;
+  const permissionLabel = toTitleCase(userRole || "viewer");
+  const activeNowCount = new Set(
+    messages
+      .slice(-12)
+      .map((chatMessage) => chatMessage.senderId)
+      .filter((senderId) => senderId && senderId !== "AI")
+  ).size;
 
   return (
-    <div className="flex h-screen bg-yellow-50">
-      <div className="flex-1 flex flex-col">
+    <div className="page-shell">
+      <div className="page-frame">
+      <div className={`flex min-h-[calc(100vh-2rem)] flex-col gap-4 ${activeThreadMessageID ? "xl:pr-[26rem]" : ""}`}>
         {/* Header with Search */}
-        <header className="p-4 bg-yellow-500 text-white border-b border-yellow-700 relative z-10">
-          <div className="flex justify-between items-center mb-3">
-            <h1 className="font-bold text-lg flex items-center gap-2">
+        <header className="workspace-shell">
+          <div className="workspace-topbar">
+            <h1 className="workspace-brand-title text-[clamp(1.8rem,3vw,3rem)]">
               🐝 {hiveID} / {honeycombID}
               {unreadMessageCount > 0 && (
                 <span
-                  className="ml-2 px-2 py-0.5 bg-red-600 text-white text-xs font-semibold rounded-full"
+                  className="ml-3 inline-flex rounded-full border border-rose-300/20 bg-rose-300/15 px-3 py-1 align-middle text-xs font-semibold uppercase tracking-[0.16em] text-rose-100"
                   title={`${unreadMessageCount} unread message${
                     unreadMessageCount > 1 ? "s" : ""
                   }`}
@@ -969,23 +988,23 @@ If the attachment looks document-like but no text was extracted, say clearly tha
 
             <button
               onClick={() => router.push(`/hive/${hiveID}`)}
-              className="bg-white text-yellow-500 px-3 py-1 rounded hover:bg-gray-100 border border-yellow-700"
+              className="button-ghost"
               type="button"
             >
-              Back to Hive
+              Back to hive
             </button>
           </div>
 
-          <div className="relative">
+          <div className="glass-panel relative">
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search messages and users..."
-              className="w-full px-4 py-2 pl-10 pr-10 rounded-lg text-gray-800 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-white focus:border-white"
+              className="input-shell pl-10 pr-10"
             />
             <svg
-              className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400"
+              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
@@ -1001,7 +1020,7 @@ If the attachment looks document-like but no text was extracted, say clearly tha
             {searchQuery && (
               <button
                 onClick={() => setSearchQuery("")}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 transition hover:text-white"
                 type="button"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1012,7 +1031,7 @@ If the attachment looks document-like but no text was extracted, say clearly tha
           </div>
 
           {searchQuery && (
-            <p className="text-xs mt-2 text-yellow-100">
+            <p className="mt-3 text-xs uppercase tracking-[0.16em] text-slate-300/70">
               Found {filteredMessages.length} message
               {filteredMessages.length !== 1 ? "s" : ""}
             </p>
@@ -1020,13 +1039,13 @@ If the attachment looks document-like but no text was extracted, say clearly tha
         </header>
 
         {/* Main feed */}
-        <main className="flex-1 overflow-y-auto p-4 space-y-3">
+        <main className="chat-feed flex-1 space-y-6">
           {hasMoreMessages && messages.length > 0 && !searchQuery && (
-            <div className="flex justify-center mb-4">
+            <div className="mb-4 flex justify-center">
               <button
                 onClick={handleLoadOlderMessages}
                 disabled={loadingOlderMessages}
-                className="bg-gradient-to-r from-blue-500 to-indigo-600 text-white px-6 py-2 rounded-lg font-semibold hover:from-blue-600 hover:to-indigo-700 transition-all duration-200 flex items-center gap-2 shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
+                className="button-secondary"
                 type="button"
               >
                 {loadingOlderMessages ? (
@@ -1047,12 +1066,12 @@ If the attachment looks document-like but no text was extracted, say clearly tha
           )}
 
           {filteredMessages.length === 0 && searchQuery ? (
-            <div className="flex flex-col items-center justify-center h-64 text-gray-500">
+            <div className="empty-state flex h-64 flex-col items-center justify-center">
               <svg className="w-16 h-16 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
               </svg>
-              <p className="text-lg font-semibold">No messages found</p>
-              <p className="text-sm">Try a different search term</p>
+              <p className="text-lg font-semibold text-white">No messages found</p>
+              <p className="text-sm text-slate-300">Try a different search term</p>
             </div>
           ) : null}
 
@@ -1065,30 +1084,30 @@ If the attachment looks document-like but no text was extracted, say clearly tha
               <div
                 id={`message-${m.id}`}
                 key={m.id}
-                className={`relative p-3 rounded-lg border-l-4 ${
+                className={`relative max-w-[52rem] rounded-[1.5rem] border p-4 shadow-lg shadow-slate-950/20 transition-transform duration-200 hover:-translate-y-0.5 ${
                   m.senderId === "AI"
-                    ? "bg-gradient-to-r from-indigo-50 to-purple-50 border-indigo-500 w-full sm:w-3/4 lg:w-1/2"
-                    : `${getUserColor(m.senderId)} w-full sm:w-3/4 lg:w-1/2 ${
+                    ? "w-full border-cyan-300/20 bg-gradient-to-br from-cyan-300/12 to-slate-900/70"
+                    : `${getUserColor(m.senderId)} w-full ${
                         m.senderId === user.uid ? "ml-auto" : ""
                       }`
                 }`}
               >
                 {threadUnread > 0 && (
                   <span
-                    className="absolute -top-2 -right-2 px-2 py-0.5 bg-blue-600 text-white text-xs rounded-full shadow"
+                    className="absolute -right-2 -top-2 rounded-full bg-cyan-400 px-2.5 py-1 text-xs font-bold text-slate-950 shadow-lg"
                     title={`${threadUnread} unread thread message${threadUnread > 1 ? "s" : ""}`}
                   >
                     {threadUnread}
                   </span>
                 )}
 
-                <div className="flex items-center gap-2 mb-1">
-                  <p className="text-sm font-bold text-gray-800">
+                <div className="mb-3 flex items-center gap-2">
+                  <p className="text-sm font-bold text-white">
                     {m.senderId === "AI" ? "🤖 " : ""}
                     {m.sender}
                   </p>
                   {m.senderId !== "AI" && userRoles[m.senderId] && (
-                    <span className="text-xs" title={userRoles[m.senderId]}>
+                    <span className="text-xs text-slate-300" title={userRoles[m.senderId]}>
                       {getRoleEmoji(userRoles[m.senderId])}
                     </span>
                   )}
@@ -1098,8 +1117,8 @@ If the attachment looks document-like but no text was extracted, say clearly tha
 
                 {/*  Attachments displayed ONCE */}
                 {attachments.length > 0 && (
-                  <div className="mt-2">
-                    <div className="text-xs font-semibold text-gray-700 mb-1">
+                  <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 p-3">
+                    <div className="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-slate-300">
                       📎 {attachments.length} attachment{attachments.length !== 1 ? "s" : ""}
                     </div>
                     <AttachmentList attachments={attachments} />
@@ -1107,19 +1126,19 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                 )}
 
                 {Array.isArray(m.linkedTaskIds) && m.linkedTaskIds.length > 0 && (
-                  <div className="mt-1 text-xs text-green-700 font-semibold">
+                  <div className="mt-3 text-xs font-semibold uppercase tracking-[0.16em] text-emerald-200">
                     ✅ Task created ({m.linkedTaskIds.length})
                   </div>
                 )}
 
-                <div className="flex flex-col sm:flex-row sm:space-x-3 space-y-2 sm:space-y-0 mt-2">
+                <div className="mt-4 flex flex-wrap gap-2">
                     {m.senderId === user.uid && (
-                    <div className="flex items-center gap-2 flex-wrap">
+                    <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/30 p-3">
                       {/* Model picker */}
                       <select
                         value={selectedModel}
                         onChange={(e) => setSelectedModel(e.target.value)}
-                        className="text-sm p-1 border border-gray-300 rounded bg-white text-gray-800 min-w-[10rem]"
+                        className="input-shell min-w-[12rem] py-2 text-sm"
                         title="Model"
                         aria-label="Choose AI model"
                       >
@@ -1132,7 +1151,7 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                       <select
                         value={aiScope}
                         onChange={(e) => setAiScope(e.target.value)}
-                        className="text-xs sm:text-sm p-1 border border-gray-300 rounded bg-white text-gray-800 min-w-[9rem]"
+                        className="input-shell min-w-[12rem] py-2 text-sm"
                         title="How much chat context to send to AI"
                         aria-label="Ask AI context scope"
                       >
@@ -1146,7 +1165,7 @@ If the attachment looks document-like but no text was extracted, say clearly tha
 
                       {/* Ask AI uses the selected scope */}
                       <button
-                        className="text-xs sm:text-sm bg-blue-600 text-white px-3 py-1.5 sm:py-1 rounded hover:bg-blue-700 shadow disabled:opacity-50"
+                        className="button-secondary"
                         onClick={() => handleAIReply(m, aiScope)}
                         disabled={loadingAI || !canChat}
                         aria-disabled={loadingAI || !canChat}
@@ -1156,10 +1175,10 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                       </button>
 
                       <button
-                        className={`text-xs sm:text-sm px-3 py-1.5 sm:py-1 rounded border shadow ${
+                        className={`rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.14em] transition ${
                           allowAIDecrypt
-                            ? "bg-amber-100 border-amber-400 text-amber-900"
-                            : "bg-white border-gray-300 text-gray-700 hover:bg-gray-50"
+                            ? "border-amber-300/30 bg-amber-300/18 text-amber-100"
+                            : "border-white/12 bg-white/6 text-slate-200 hover:bg-white/10"
                         }`}
                         onClick={() => setAllowAIDecrypt((prev) => !prev)}
                         disabled={!canChat}
@@ -1170,23 +1189,23 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                       </button>
 
                       <button
-                        className="text-xs sm:text-sm bg-green-600 text-white px-3 py-1.5 sm:py-1 rounded hover:bg-green-700 shadow disabled:opacity-50"
+                        className="button-primary"
                         onClick={() => openCreateTask(m)}
                         disabled={!canChat}
                         type="button"
                       >
-                        Create Task ✅
+                        Create task
                       </button>
                     </div>
                   )}
 
                   <button
-                    className={`text-xs sm:text-sm px-3 py-1.5 sm:py-1 rounded border font-semibold ${
+                    className={`button-ghost text-xs sm:text-sm ${
                       threadStatus === "closed"
-                        ? "bg-red-100 border-red-400 text-red-800"
+                        ? "border-rose-300/25 text-rose-100"
                         : threads[m.id]?.length > 0
-                        ? "bg-white border-gray-300 text-gray-800"
-                        : "bg-yellow-100 border-yellow-400 text-yellow-800"
+                        ? "border-white/16 text-white"
+                        : "border-amber-300/25 text-amber-100"
                     }`}
                     onClick={() => handleOpenThread(m.id)}
                     type="button"
@@ -1208,19 +1227,19 @@ If the attachment looks document-like but no text was extracted, say clearly tha
         {/* Composer */}
         <form
           onSubmit={handleSendMessage}
-          className="p-2 sm:p-4 flex flex-col gap-2 bg-white border-t border-gray-300"
+          className="chat-composer flex flex-col gap-3 p-4"
         >
           {/* ✅ Pending attachment queue UI */}
           {pendingAttachments.length > 0 && (
-            <div className="w-full p-2 rounded-lg border border-blue-200 bg-blue-50">
+            <div className="w-full rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-3">
               <div className="flex items-center justify-between mb-2">
-                <p className="text-xs font-semibold text-blue-800">
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-100">
                   📎 Ready to send ({pendingAttachments.length})
                 </p>
 
                 <button
                   type="button"
-                  className="text-xs text-blue-700 underline hover:text-blue-900"
+                  className="text-xs font-semibold text-cyan-100 underline transition hover:text-white"
                   onClick={() => setPendingAttachments([])}
                 >
                   Clear
@@ -1231,15 +1250,15 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                 {pendingAttachments.map((a, idx) => (
                   <div
                     key={`${a?.url || a?.name || "file"}-${idx}`}
-                    className="flex items-center gap-2 px-2 py-1 rounded bg-white border border-blue-200"
+                    className="flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/40 px-3 py-2"
                   >
-                    <span className="text-xs text-gray-800 break-all max-w-[240px]">
+                    <span className="max-w-[240px] break-all text-xs text-slate-100">
                       {a?.name || "file"}
                     </span>
 
                     <button
                       type="button"
-                      className="text-xs text-red-600 hover:text-red-800"
+                      className="text-xs text-rose-200 transition hover:text-rose-100"
                       onClick={() =>
                         setPendingAttachments((prev) =>
                           prev.filter((_, i) => i !== idx)
@@ -1253,16 +1272,16 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                 ))}
               </div>
 
-              <p className="text-[11px] text-blue-700 mt-2">
+              <p className="mt-2 text-[11px] text-cyan-100/80">
                 Uploads are queued. Click <b>Send</b> to post them to the chat.
               </p>
             </div>
           )}
 
-          <div className="flex gap-2">
+          <div className="flex flex-col gap-3 lg:flex-row">
             <div className="flex-1 relative">
               <input
-                className="w-full border border-gray-400 rounded-lg p-2 pr-12 text-sm sm:text-base text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400"
+                className="input-shell pr-12"
                 placeholder={canChat ? "Type or use voice..." : "View-only access"}
                 value={message}
                 onChange={(e) => setMessage(e.target.value)}
@@ -1275,8 +1294,8 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                   onClick={toggleVoiceRecording}
                   className={`absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg transition-all duration-200 ${
                     isRecording
-                      ? "bg-red-500 text-white animate-pulse"
-                      : "bg-blue-100 text-blue-600 hover:bg-blue-200"
+                      ? "bg-rose-500 text-white shadow-lg shadow-rose-500/20"
+                      : "bg-cyan-300/12 text-cyan-100 hover:bg-cyan-300/20"
                   }`}
                   title={isRecording ? "Stop recording" : "Start voice input"}
                 >
@@ -1297,18 +1316,22 @@ If the attachment looks document-like but no text was extracted, say clearly tha
               honeycombID={honeycombID}
               userId={user.uid}
               onUploaded={handleFileUploaded}
-              onUploadStateChange={setUploadingAttachment}
+              onUploadStateChange={setUploadState}
             />
           )}
 
             <button
               type="submit"
               disabled={sendDisabled}
-              className="bg-yellow-400 px-3 sm:px-4 py-2 rounded-lg font-semibold hover:bg-yellow-500 border border-yellow-700 flex items-center gap-2 disabled:opacity-50"
-              title={uploadingAttachment ? "Wait for upload to finish" : "Send"}
+              className="button-primary min-w-[8rem]"
+              title={uploadState.busy ? "Wait for file processing to finish" : "Send"}
             >
               <span className="hidden sm:inline">
-                {uploadingAttachment ? "Uploading..." : "Send"}
+                {uploadState.phase === "processing"
+                  ? "Processing..."
+                  : uploadState.phase === "uploading"
+                  ? `Uploading ${uploadState.progress}%`
+                  : "Send"}
               </span>
               <svg
                 className="w-5 h-5 sm:hidden"
@@ -1362,6 +1385,7 @@ If the attachment looks document-like but no text was extracted, say clearly tha
         attachmentText={modalAttachmentText}
       />
     </div>
+    </div>
   );
 }
 
@@ -1405,16 +1429,16 @@ function ThreadPanel({
     if (threadUserColors[userId]) return threadUserColors[userId];
 
     const colors = [
-      "border-yellow-500 bg-yellow-50",
-      "border-blue-500 bg-blue-50",
-      "border-green-500 bg-green-50",
-      "border-purple-500 bg-purple-50",
-      "border-pink-500 bg-pink-50",
-      "border-indigo-500 bg-indigo-50",
-      "border-orange-500 bg-orange-50",
-      "border-teal-500 bg-teal-50",
-      "border-red-500 bg-red-50",
-      "border-cyan-500 bg-cyan-50",
+      "border-amber-300/30 bg-amber-300/10",
+      "border-blue-300/30 bg-blue-300/10",
+      "border-emerald-300/30 bg-emerald-300/10",
+      "border-violet-300/30 bg-violet-300/10",
+      "border-pink-300/30 bg-pink-300/10",
+      "border-indigo-300/30 bg-indigo-300/10",
+      "border-orange-300/30 bg-orange-300/10",
+      "border-teal-300/30 bg-teal-300/10",
+      "border-rose-300/30 bg-rose-300/10",
+      "border-cyan-300/30 bg-cyan-300/10",
     ];
 
     const randomColor = colors[Math.floor(Math.random() * colors.length)];
@@ -1579,7 +1603,7 @@ function ThreadPanel({
   return (
     <div
       ref={panelRef}
-      className={`fixed right-0 top-0 h-full bg-white border-l border-gray-300 p-2 sm:p-4 shadow-lg flex flex-col z-50 ${
+      className={`thread-panel-shell fixed right-0 top-0 z-50 flex h-full flex-col p-3 sm:p-4 ${
         isMobile ? "left-0" : ""
       }`}
       style={isMobile ? {} : { width: `${panelWidth}px` }}
@@ -1595,23 +1619,23 @@ function ThreadPanel({
       )}
 
       <button
-        className="bg-yellow-400 px-3 sm:px-4 py-2 rounded-lg text-sm sm:text-base font-semibold hover:bg-yellow-500 border border-yellow-700 mb-3"
+        className="button-ghost mb-3 text-sm sm:text-base"
         onClick={onClose}
         type="button"
       >
         Close
       </button>
 
-      <div className="flex-1 overflow-y-auto">
-        <p className="font-bold mb-2 text-gray-900 whitespace-pre-wrap leading-relaxed">
+      <div className="flex-1 overflow-y-auto rounded-[1.5rem] border border-white/10 bg-slate-950/30 p-4">
+        <p className="mb-3 whitespace-pre-wrap text-base font-bold leading-relaxed text-white">
           {parentMessage?.text}
         </p>
 
-        <p className="text-xs font-semibold mb-2">
+        <p className="mb-3 text-xs font-semibold uppercase tracking-[0.16em] text-slate-300">
           Status:{" "}
           <span
             className={
-              threadClosed ? "text-red-600 font-bold" : "text-green-600 font-bold"
+              threadClosed ? "font-bold text-rose-200" : "font-bold text-emerald-200"
             }
           >
             {threadStatus.toUpperCase()}
@@ -1621,46 +1645,46 @@ function ThreadPanel({
         {currentThread.map((thread) => (
           <div
             key={thread.id}
-            className={`mb-2 p-2 rounded border-l-4 ${
+            className={`mb-3 rounded-2xl border p-3 ${
               thread.senderId === "AI"
-                ? "bg-gradient-to-r from-indigo-50 to-purple-50 border-indigo-500"
+                ? "border-cyan-300/20 bg-cyan-300/10"
                 : `${getThreadUserColor(thread.senderId)}`
             }`}
           >
-            <div className="flex items-center gap-2 mb-1">
-              <p className="text-xs font-semibold text-gray-700">
+            <div className="mb-1 flex items-center gap-2">
+              <p className="text-xs font-semibold text-slate-100">
                 {thread.senderId === "AI" ? "🤖 " : ""}
                 {thread.sender}
               </p>
               {thread.senderId !== "AI" && threadUserRoles[thread.senderId] && (
-                <span className="text-xs" title={threadUserRoles[thread.senderId]}>
+                <span className="text-xs text-slate-300" title={threadUserRoles[thread.senderId]}>
                   {getRoleEmoji(threadUserRoles[thread.senderId])}
                 </span>
               )}
             </div>
-            <p className="text-sm text-gray-900 break-words whitespace-pre-wrap leading-relaxed">
+            <p className="break-words whitespace-pre-wrap text-sm leading-relaxed text-slate-100">
               {thread.text}
             </p>
           </div>
         ))}
       </div>
-        <div className="p-4 bg-indigo-900 text-white rounded-xl shadow-lg mb-6 border-b-4 border-indigo-700">
+        <div className="mb-6 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-white shadow-lg">
   <h3 className="text-sm font-bold flex items-center gap-2 mb-3">🧠 Ask Hive Mind</h3>
   <input 
     value={memoryQuery} 
     onChange={(e) => setMemoryQuery(e.target.value)} 
-    className="w-full p-3 rounded text-white text-sm mb-2" 
+    className="input-shell mb-2 text-sm" 
     placeholder="Ask a previous decision..." 
   />
   <button 
     onClick={handleSearchMemory} 
     disabled={isSearchingMemory}
-    className="w-full bg-yellow-400 hover:bg-yellow-500 text-indigo-900 font-bold py-2 rounded text-xs transition-colors"
+    className="button-primary w-full text-xs"
   >
     {isSearchingMemory ? "Thinking..." : "Query Memory"}
   </button>
   {memoryResponse && (
-    <div className="mt-2 text-xs bg-indigo-800 p-2 rounded border border-indigo-600 animate-in fade-in">
+    <div className="mt-2 rounded-xl border border-white/10 bg-slate-950/40 p-3 text-xs text-slate-100">
       {memoryResponse}
     </div>
   )}
@@ -1675,10 +1699,10 @@ function ThreadPanel({
       {currentThread[0]?.senderId === user.uid && canChat && (
         <button
   onClick={handleToggleThreadStatus} // Much cleaner!
-  className={`mt-2 px-4 py-2 rounded-md font-semibold ${
+  className={`mt-2 rounded-full px-4 py-2 font-semibold ${
     threadClosed
-      ? "bg-green-500 text-white hover:bg-green-600"
-      : "bg-red-500 text-white hover:bg-red-600"
+      ? "bg-emerald-500 text-white hover:bg-emerald-600"
+      : "bg-rose-500 text-white hover:bg-rose-600"
   }`}
   type="button"
 >
@@ -1692,8 +1716,8 @@ function ThreadPanel({
             (s) => s.threadID === currentThread[0]?.id
           );
           return threadSummary ? (
-            <div className="mt-4 bg-gradient-to-br from-indigo-50 via-blue-50 to-cyan-50 border-2 border-indigo-200 rounded-2xl shadow-lg overflow-hidden">
-              <div className="bg-gradient-to-r from-indigo-600 to-blue-600 px-4 py-3 flex items-center gap-2">
+            <div className="mt-4 overflow-hidden rounded-2xl border border-white/10 bg-white/5 shadow-lg">
+              <div className="flex items-center gap-2 border-b border-white/10 bg-cyan-300/10 px-4 py-3">
                 <span className="text-2xl">✨</span>
                 <h2 className="text-base font-bold text-white">Thread Summary</h2>
               </div>
@@ -1713,22 +1737,22 @@ function ThreadPanel({
 
 
       {showHelp && (
-        <div className="mt-4 p-3 bg-white border border-gray-200 rounded-lg shadow-sm">
-          <div className="flex justify-between items-start">
-            <h3 className="text-sm font-semibold">UI Guide</h3>
+        <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-3 shadow-sm">
+          <div className="flex items-start justify-between">
+            <h3 className="text-sm font-semibold text-white">UI Guide</h3>
             <button
               onClick={dismissHelp}
-              className="text-xs text-gray-500 hover:text-gray-800"
+              className="text-xs text-slate-400 hover:text-white"
               title="Dismiss help"
               type="button"
             >
               Got it
             </button>
           </div>
-          <p className="text-xs text-gray-600 mt-2">
+          <p className="mt-2 text-xs text-slate-300">
             Quick orientation to the Honeycomb UI:
           </p>
-          <ul className="text-xs text-gray-600 mt-2 list-disc list-inside space-y-1">
+          <ul className="mt-2 list-disc list-inside space-y-1 text-xs text-slate-300">
             <li>
               <strong>Messages:</strong> Main feed on the left. Click
               “Start/View Thread” to open a sub-conversation.
@@ -1816,7 +1840,7 @@ function SummaryCard({
         const messageCount = threadMessages?.length || 0;
 
         return (
-          <div className="bg-white rounded-xl border-2 border-indigo-100 shadow-sm hover:shadow-md transition-all duration-200">
+          <div className="rounded-2xl border border-white/10 bg-slate-950/35 shadow-sm transition-all duration-200 hover:border-cyan-300/20 hover:shadow-lg">
             <div className="p-3 cursor-pointer" onClick={() => setExpanded(!expanded)}>
               <div className="flex items-start justify-between gap-2">
                 <div className="flex items-start gap-2 flex-1">
@@ -1830,24 +1854,24 @@ function SummaryCard({
 
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 mb-1 flex-wrap">
-                      <span className="text-xs font-semibold text-indigo-700">
+                      <span className="text-xs font-semibold text-cyan-100">
                         Thread #{String(summary.threadID || "").slice(0, 8)}
                       </span>
 
                       {messageCount > 0 && (
-                        <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-medium">
+                        <span className="rounded-full bg-cyan-300/12 px-2 py-0.5 text-xs font-medium text-cyan-100">
                           {messageCount} message{messageCount !== 1 ? "s" : ""}
                         </span>
                       )}
 
-                      <span className="text-xs text-gray-500">
+                      <span className="text-xs text-slate-400">
                         {getRelativeTime(summary.generatedAt)}
                       </span>
 
                       {summary.closedByUserName && (
-                        <span className="text-xs text-gray-500 flex items-center gap-1">
+                        <span className="flex items-center gap-1 text-xs text-slate-400">
                           by{" "}
-                          <span className="font-medium text-gray-700">
+                          <span className="font-medium text-slate-200">
                             {summary.closedByUserName}
                           </span>
                           {summary.closedByRole && (
@@ -1860,7 +1884,7 @@ function SummaryCard({
                     </div>
 
                     <p
-                      className={`text-sm text-gray-700 leading-relaxed ${
+                      className={`text-sm leading-relaxed text-slate-100 ${
                         !expanded ? "line-clamp-2" : ""
                       }`}
                     >
@@ -1870,7 +1894,7 @@ function SummaryCard({
                 </div>
 
                 <button
-                  className="flex-shrink-0 text-indigo-600 hover:text-indigo-800 transition-transform duration-200"
+                  className="flex-shrink-0 text-cyan-100 transition-transform duration-200 hover:text-white"
                   style={{ transform: expanded ? "rotate(180deg)" : "rotate(0deg)" }}
                   type="button"
                 >
@@ -1883,8 +1907,8 @@ function SummaryCard({
 
             {expanded && (
               <div className="px-3 pb-3 pt-0">
-                <div className="bg-gradient-to-br from-gray-50 to-blue-50 p-3 rounded-lg border border-gray-200 mb-3">
-                  <p className="text-sm text-gray-800 whitespace-pre-wrap leading-relaxed">
+                <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-3">
+                  <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-100">
                     {summary.summaryText}
                   </p>
                 </div>
@@ -1892,7 +1916,7 @@ function SummaryCard({
                 <div className="flex gap-2">
                   <button
                     onClick={handleCopy}
-                    className="flex-1 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg font-semibold text-sm hover:bg-gray-200 transition-all duration-200 flex items-center justify-center gap-2"
+                    className="button-ghost flex-1 text-sm"
                     type="button"
                   >
                     {copied ? "✓ Copied!" : "📋 Copy"}
@@ -1904,7 +1928,7 @@ function SummaryCard({
                         e.stopPropagation();
                         onOpenThread && onOpenThread(summary.parentMessageID);
                       }}
-                      className="flex-1 bg-gradient-to-r from-indigo-600 to-blue-600 text-white px-4 py-2 rounded-lg font-semibold text-sm hover:from-indigo-700 hover:to-blue-700 transition-all duration-200 flex items-center justify-center gap-2 shadow-sm"
+                      className="button-primary flex-1 text-sm"
                       type="button"
                     >
                       Open Thread
@@ -1931,19 +1955,19 @@ function ThreadInput({ parentMessageID, onSend, inputRef, disabled }) {
   };
 
   return (
-    <form onSubmit={handleSubmit} className="flex mt-2">
+    <form onSubmit={handleSubmit} className="mt-2 flex gap-2">
       <input
         ref={inputRef}
         value={text}
         onChange={(e) => setText(e.target.value)}
         placeholder={disabled ? "Thread is closed or view-only" : "Reply in thread..."}
         disabled={disabled}
-        className="flex-1 border border-gray-300 rounded-md p-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:border-yellow-400 disabled:bg-gray-100"
+        className="input-shell flex-1 text-sm"
       />
       <button
         type="submit"
         disabled={disabled}
-        className="ml-1 px-3 py-1 bg-yellow-400 text-white rounded-md text-sm font-semibold hover:bg-yellow-500 disabled:opacity-50"
+        className="button-primary text-sm"
       >
         Reply
       </button>
