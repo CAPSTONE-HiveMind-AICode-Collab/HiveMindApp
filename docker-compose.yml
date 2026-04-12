@@ -3,7 +3,6 @@ services:
     build:
       context: .
       args:
-        # This tells Docker to take these values from your local machine's environment
         - NEXT_PUBLIC_FIREBASE_API_KEY=${NEXT_PUBLIC_FIREBASE_API_KEY}
         - NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN}
         - NEXT_PUBLIC_FIREBASE_PROJECT_ID=${NEXT_PUBLIC_FIREBASE_PROJECT_ID}
@@ -17,8 +16,15 @@ services:
     env_file:
       - .env.local
     restart: always
+    # Runtime Limits for Application Layer
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'      # Max 75% of one CPU core
+          memory: 1024M    # Max 1GB RAM
+        reservations:
+          memory: 512M     # Minimum 512MB RAM
 
-  #Looks at your Docker engine usage "monitoring"
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:latest
     container_name: hivemind-monitor
@@ -29,8 +35,15 @@ services:
       - /var/run:/var/run:ro
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
+    # Runtime Limits for Monitoring Agent
+    deploy:
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 256M
+        reservations:
+          memory: 128M
 
-  #Collects the data or the "brain" of your monitoring toolset
   prometheus:
     image: prom/prometheus:latest
     container_name: hivemind-prometheus
@@ -38,14 +51,27 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    # Runtime Limits for Data Processing
+    deploy:
+      resources:
+        limits:
+          cpus: '0.30'
+          memory: 512M
+        reservations:
+          memory: 256M
 
-  #The dashboard showing all container data
   grafana:
     image: grafana/grafana:latest
     container_name: hivemind-grafana
     ports:
-      - "3001:3000" # Access at http://localhost:3001
+      - "3001:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin # Default login is admin/admin
-
-  
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    # Runtime Limits for Visualization
+    deploy:
+      resources:
+        limits:
+          cpus: '0.30'
+          memory: 512M
+        reservations:
+          memory: 256M

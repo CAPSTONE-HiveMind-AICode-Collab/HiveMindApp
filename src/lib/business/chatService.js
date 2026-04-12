@@ -42,26 +42,52 @@ const normalizeUserIds = (allUserIds) =>
 
 const normalizeAttachment = (attachment) => {
   if (!attachment) return null;
-  return Array.isArray(attachment) ? attachment : [attachment];
+
+  const arr = Array.isArray(attachment) ? attachment : [attachment];
+
+  const normalized = arr
+    .filter(Boolean)
+    .map((a) => ({
+      name: a?.name || "",
+      size: a?.size || 0,
+      contentType: a?.contentType || "application/octet-stream",
+      url: a?.url || "",
+      storagePath: a?.storagePath || "",
+      uploadedAt: a?.uploadedAt || null,
+
+      text: a?.text || null,
+      extractedText: a?.extractedText || null,
+      imageDescription: a?.imageDescription || null,
+
+      rawCaption: a?.rawCaption || null,
+      captionRisk: a?.captionRisk || null,
+      captionNotes: Array.isArray(a?.captionNotes) ? a.captionNotes : [],
+
+      extractionMethod: a?.extractionMethod || null,
+      extractionStatus: a?.extractionStatus || null,
+      extractionError: a?.extractionError || null,
+      isDocumentLike: !!a?.isDocumentLike,
+      ocrConfidence: a?.ocrConfidence ?? null,
+    }));
+
+  return normalized.length > 0 ? normalized : null;
 };
 
-export function useSendUserMessage() {
-  const { user } = useUser();
+  export function useSendUserMessage() {
+    const { user } = useUser();
 
-  // NOTE: keep signature compatible with your chat page:
-  // sendUserMessage(text, hiveID, honeycombID, [], pendingAttachments)
-  const sendMessage = async (
-    text,
-    hiveID,
-    honeycombID,
-    allUserIds = [],
-    attachment = null
-  ) => {
-    if (!user) throw new Error("User not authenticated");
+    const sendMessage = async (
+      text,
+      hiveID,
+      honeycombID,
+      allUserIds = [],
+      attachment = null
+    ) => {
+      if (!user) throw new Error("User not authenticated");
 
-    const cleanedText = String(text || "").trim();
-    const normalized = normalizeAttachment(attachment); // array or null
-    const hasAttachments = Array.isArray(normalized) && normalized.length > 0;
+      const cleanedText = String(text || "").trim();
+      const normalized = normalizeAttachment(attachment);
+      const hasAttachments = Array.isArray(normalized) && normalized.length > 0;
 
     // Toxicity check only when there is text to analyze
     if (cleanedText) {
@@ -80,26 +106,27 @@ export function useSendUserMessage() {
       }
     }
 
-    //  allow “attachments-only” messages
-    if (!cleanedText && !hasAttachments) return;
+      if (!cleanedText && !hasAttachments) return;
 
-    const messagesRef = collection(
-      db,
-      "Hive",
-      String(hiveID),
-      "Honeycomb",
-      String(honeycombID),
-      "messages"
-    );
+      const messagesRef = collection(
+        db,
+        "Hive",
+        String(hiveID),
+        "Honeycomb",
+        String(honeycombID),
+        "messages"
+      );
 
-    const msgRef = await addDoc(messagesRef, {
-      type: hasAttachments ? "file" : "text",
-      text: cleanedText,
-      attachment: normalized, 
-      sender: user.displayName || user.email || "User",
-      senderId: user.uid,
-      timestamp: serverTimestamp(),
-    });
+      console.log("ATTACHMENT RECEIVED IN chatService", normalized);
+
+      const msgRef = await addDoc(messagesRef, {
+        type: hasAttachments ? "file" : "text",
+        text: cleanedText,
+        attachment: normalized,
+        sender: user.displayName || user.email || "User",
+        senderId: user.uid,
+        timestamp: serverTimestamp(),
+      });
 
     //initialize userStatus docs for all users (except sender)
     const ids = normalizeUserIds(allUserIds);
@@ -127,11 +154,11 @@ export function useSendUserMessage() {
 
     await touchHiveLastActive(hiveID);
 
-    return msgRef.id;
-  };
+      return msgRef.id;
+    };
 
-  return sendMessage;
-}
+    return sendMessage;
+  }
 
 
 /*
@@ -195,28 +222,54 @@ export function subscribeToChatMessages(callback, hiveID, honeycombID) {
   const messagesRef = collection(db, "Hive", hid, "Honeycomb", cid, "messages");
   const q = query(messagesRef, orderBy("timestamp", "asc"));
 
-  return onSnapshot(q, (snapshot) => {
-    const msgs = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
-    callback(msgs);
-  });
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const msgs = snapshot.docs.map((d) => ({
+        id: d.id,
+        ...d.data(),
+      }));
+      callback(msgs);
+    },
+    (error) => {
+      console.error("subscribeToChatMessages failed:", error);
+    }
+  );
 }
 /**
  * Load older messages for pagination
  * Returns messages older than the oldest current message
  */
-export async function loadOlderMessages(hiveID, honeycombID, oldestTimestamp, messageLimit = 50) {
-  const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
+export async function loadOlderMessages(
+  hiveID,
+  honeycombID,
+  oldestTimestamp,
+  messageLimit = 50
+) {
+  const messagesRef = collection(
+    db,
+    "Hive",
+    String(hiveID),
+    "Honeycomb",
+    String(honeycombID),
+    "messages"
+  );
+
   const q = query(
-    messagesRef, 
-    orderBy("timestamp", "desc"), 
+    messagesRef,
+    orderBy("timestamp", "desc"),
     where("timestamp", "<", oldestTimestamp),
     limit(messageLimit)
   );
-  
+
   const snapshot = await getDocs(q);
+
   return snapshot.docs
-    .map((doc) => ({ id: doc.id, ...doc.data() }))
-    .reverse(); // Reverse to show oldest first
+    .map((docSnap) => ({
+      id: docSnap.id,
+      ...docSnap.data(),
+    }))
+    .reverse();
 }
 
 /* ----------------- THREADS ----------------- */
@@ -461,7 +514,7 @@ export async function getUnreadCount(hiveID, honeycombID, uid, parentMessageID =
 
   let ref;
   if (parentMessageID) {
-    ref = collection(db, "Hive", hid, "HoneyComb", cid, "messages", String(parentMessageID), "Threads");
+    ref = collection(db, "Hive", hid, "Honeycomb", cid, "messages", String(parentMessageID), "Threads");
   } else {
     ref = collection(db, "Hive", hid, "Honeycomb", cid, "messages");
   }
