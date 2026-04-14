@@ -16,13 +16,12 @@ import {
 
 import { db } from "@/lib/firebase/config"; //  removed model import
 import { useUser } from "../auth/userContext";
-import { callGeminiAPI } from "@/lib/data/aiRepository";
+import { callGeminiAPI, getAIResponseIssue } from "@/lib/data/aiRepository";
 import { updateThreadStatus, getThreadParticipants } from "@/lib/data/firestoreRepository";
 import { scheduleTimeBasedNotification, notifyUsers } from "@/lib/business/notificationService";
 import { generateAndStoreThreadSummary } from "@/lib/data/summaryRepository";
 import { generateAndStoreDecisionRecordForThread } from "@/lib/data/decisionRepository";
 import { touchHiveLastActive } from "@/lib/data/hiveRepository";
-import { NectarRepository } from "@/lib/data/nectarRepository";
 import { isToxicMessage, getToxicityDetails } from "@/lib/business/ToxicityService";
 /* ----------------- Notifications -----------------*/
 
@@ -42,52 +41,38 @@ const normalizeUserIds = (allUserIds) =>
 
 const normalizeAttachment = (attachment) => {
   if (!attachment) return null;
-
-  const arr = Array.isArray(attachment) ? attachment : [attachment];
-
-  const normalized = arr
-    .filter(Boolean)
-    .map((a) => ({
-      name: a?.name || "",
-      size: a?.size || 0,
-      contentType: a?.contentType || "application/octet-stream",
-      url: a?.url || "",
-      storagePath: a?.storagePath || "",
-      uploadedAt: a?.uploadedAt || null,
-
-      text: a?.text || null,
-      extractedText: a?.extractedText || null,
-      imageDescription: a?.imageDescription || null,
-
-      rawCaption: a?.rawCaption || null,
-      captionRisk: a?.captionRisk || null,
-      captionNotes: Array.isArray(a?.captionNotes) ? a.captionNotes : [],
-
-      extractionMethod: a?.extractionMethod || null,
-      extractionStatus: a?.extractionStatus || null,
-      extractionError: a?.extractionError || null,
-      isDocumentLike: !!a?.isDocumentLike,
-      ocrConfidence: a?.ocrConfidence ?? null,
-    }));
-
-  return normalized.length > 0 ? normalized : null;
+  return Array.isArray(attachment) ? attachment : [attachment];
 };
 
-  export function useSendUserMessage() {
-    const { user } = useUser();
+const normalizeFileMentions = (fileMentions) => {
+  if (!Array.isArray(fileMentions)) return [];
 
-    const sendMessage = async (
-      text,
-      hiveID,
-      honeycombID,
-      allUserIds = [],
-      attachment = null
-    ) => {
-      if (!user) throw new Error("User not authenticated");
+  return [...new Set(
+    fileMentions
+      .map((entry) => String(entry || "").trim().replace(/\\/g, "/").replace(/^\/+/, ""))
+      .filter(Boolean)
+  )];
+};
 
-      const cleanedText = String(text || "").trim();
-      const normalized = normalizeAttachment(attachment);
-      const hasAttachments = Array.isArray(normalized) && normalized.length > 0;
+export function useSendUserMessage() {
+  const { user } = useUser();
+
+  // NOTE: keep signature compatible with your chat page:
+  // sendUserMessage(text, hiveID, honeycombID, [], pendingAttachments)
+  const sendMessage = async (
+    text,
+    hiveID,
+    honeycombID,
+    allUserIds = [],
+    attachment = null,
+    options = {}
+  ) => {
+    if (!user) throw new Error("User not authenticated");
+
+    const cleanedText = String(text || "").trim();
+    const normalized = normalizeAttachment(attachment); // array or null
+    const fileMentions = normalizeFileMentions(options?.fileMentions);
+    const hasAttachments = Array.isArray(normalized) && normalized.length > 0;
 
     // Toxicity check only when there is text to analyze
     if (cleanedText) {
@@ -106,27 +91,27 @@ const normalizeAttachment = (attachment) => {
       }
     }
 
-      if (!cleanedText && !hasAttachments) return;
+    //  allow “attachments-only” messages
+    if (!cleanedText && !hasAttachments) return;
 
-      const messagesRef = collection(
-        db,
-        "Hive",
-        String(hiveID),
-        "Honeycomb",
-        String(honeycombID),
-        "messages"
-      );
+    const messagesRef = collection(
+      db,
+      "Hive",
+      String(hiveID),
+      "Honeycomb",
+      String(honeycombID),
+      "messages"
+    );
 
-      console.log("ATTACHMENT RECEIVED IN chatService", normalized);
-
-      const msgRef = await addDoc(messagesRef, {
-        type: hasAttachments ? "file" : "text",
-        text: cleanedText,
-        attachment: normalized,
-        sender: user.displayName || user.email || "User",
-        senderId: user.uid,
-        timestamp: serverTimestamp(),
-      });
+    const msgRef = await addDoc(messagesRef, {
+      type: hasAttachments ? "file" : "text",
+      text: cleanedText,
+      attachment: normalized,
+      fileMentions,
+      sender: user.displayName || user.email || "User",
+      senderId: user.uid,
+      timestamp: serverTimestamp(),
+    });
 
     //initialize userStatus docs for all users (except sender)
     const ids = normalizeUserIds(allUserIds);
@@ -154,11 +139,11 @@ const normalizeAttachment = (attachment) => {
 
     await touchHiveLastActive(hiveID);
 
-      return msgRef.id;
-    };
+    return msgRef.id;
+  };
 
-    return sendMessage;
-  }
+  return sendMessage;
+}
 
 
 /*
@@ -222,54 +207,28 @@ export function subscribeToChatMessages(callback, hiveID, honeycombID) {
   const messagesRef = collection(db, "Hive", hid, "Honeycomb", cid, "messages");
   const q = query(messagesRef, orderBy("timestamp", "asc"));
 
-  return onSnapshot(
-    q,
-    (snapshot) => {
-      const msgs = snapshot.docs.map((d) => ({
-        id: d.id,
-        ...d.data(),
-      }));
-      callback(msgs);
-    },
-    (error) => {
-      console.error("subscribeToChatMessages failed:", error);
-    }
-  );
+  return onSnapshot(q, (snapshot) => {
+    const msgs = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+    callback(msgs);
+  });
 }
 /**
  * Load older messages for pagination
  * Returns messages older than the oldest current message
  */
-export async function loadOlderMessages(
-  hiveID,
-  honeycombID,
-  oldestTimestamp,
-  messageLimit = 50
-) {
-  const messagesRef = collection(
-    db,
-    "Hive",
-    String(hiveID),
-    "Honeycomb",
-    String(honeycombID),
-    "messages"
-  );
-
+export async function loadOlderMessages(hiveID, honeycombID, oldestTimestamp, messageLimit = 50) {
+  const messagesRef = collection(db, "Hive", hiveID, "Honeycomb", honeycombID, "messages");
   const q = query(
-    messagesRef,
-    orderBy("timestamp", "desc"),
+    messagesRef, 
+    orderBy("timestamp", "desc"), 
     where("timestamp", "<", oldestTimestamp),
     limit(messageLimit)
   );
-
+  
   const snapshot = await getDocs(q);
-
   return snapshot.docs
-    .map((docSnap) => ({
-      id: docSnap.id,
-      ...docSnap.data(),
-    }))
-    .reverse();
+    .map((doc) => ({ id: doc.id, ...doc.data() }))
+    .reverse(); // Reverse to show oldest first
 }
 
 /* ----------------- THREADS ----------------- */
@@ -403,10 +362,11 @@ export async function sendAIReply(text, hiveID, honeycombID) {
 
   try {
     const aiResponse = await callGeminiAPI(text);
+    const issue = getAIResponseIssue(aiResponse);
 
     await addDoc(messagesRef, {
       type: "text",
-      text: aiResponse,
+      text: issue ? "AI could not generate a response right now." : aiResponse,
       sender: "AI Bot",
       senderId: "AI",
       timestamp: serverTimestamp(),
@@ -514,7 +474,7 @@ export async function getUnreadCount(hiveID, honeycombID, uid, parentMessageID =
 
   let ref;
   if (parentMessageID) {
-    ref = collection(db, "Hive", hid, "Honeycomb", cid, "messages", String(parentMessageID), "Threads");
+    ref = collection(db, "Hive", hid, "HoneyComb", cid, "messages", String(parentMessageID), "Threads");
   } else {
     ref = collection(db, "Hive", hid, "Honeycomb", cid, "messages");
   }
@@ -688,10 +648,11 @@ export async function sendAssistantAIReply(promptText, uid) {
 
   try {
     const aiResponse = await callGeminiAPI(promptText);
+    const issue = getAIResponseIssue(aiResponse);
 
     await addDoc(ref, {
       type: "text",
-      text: aiResponse,
+      text: issue ? "AI could not generate a response right now." : aiResponse,
       attachment: null,
       sender: "AI Bot",
       senderId: "AI",
@@ -714,18 +675,4 @@ export async function sendAssistantAIReply(promptText, uid) {
 export const closeThread = async (hiveId, threadId, messages) => {
   // Step 1: Normal closure logic (Update status in Firestore)
   await updateThreadStatus(threadId, "closed");
-
-  // Step 2: MANUAL NECTAR EXTRACTION
-  // Format the context for the AI
-  const threadContext = messages
-    .map(m => `${m.sender}: ${m.text}`)
-    .join("\n");
-
-  try {
-    console.log("Distilling Knowledge Nectar...");
-    await NectarRepository.distillAndSave(hiveId, threadContext);
-    console.log("Nectar saved to Hive Memory!");
-  } catch (error) {
-    console.error("Nectar extraction failed, but thread was closed.", error);
-  }
 };

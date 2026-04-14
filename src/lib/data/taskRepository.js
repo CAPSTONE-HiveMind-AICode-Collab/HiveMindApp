@@ -2,6 +2,7 @@
 import {
   addDoc,
   collection,
+  deleteDoc,
   doc,
   getDocs,
   orderBy,
@@ -217,6 +218,16 @@ export async function updateTaskRecord({ hiveID, taskID, patch }) {
     ...nextPatch,
     updatedAt: serverTimestamp(),
   });
+
+  await syncHiveDirectoryMetrics(hid, { touchLastActive: true });
+}
+
+export async function deleteTaskRecord({ hiveID, taskID }) {
+  const hid = asId(hiveID, "hiveID");
+  const tid = asId(taskID, "taskID");
+
+  const taskRef = doc(db, "Hive", hid, "tasks", tid);
+  await deleteDoc(taskRef);
 
   await syncHiveDirectoryMetrics(hid, { touchLastActive: true });
 }

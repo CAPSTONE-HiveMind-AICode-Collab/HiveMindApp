@@ -20,7 +20,6 @@ const ALLOWED_GEMINI_MODELS = new Set([
   "gemini-2.5-pro",
 ]);
 
-const ALLOWED_PROVIDERS = new Set(["gemini", "anthropic"]);
 const DEFAULT_ROLE = "VIEWER";
 
 function extractGeminiError(err) {
@@ -37,14 +36,16 @@ function extractGeminiError(err) {
   };
 }
 
-function isQuotaError(error) {
+function isRateLimitError(error) {
+  const status = String(error?.status || "");
+  const message = String(error?.message || "");
+
   return (
     error?.code === 429 ||
-    error?.status === "RESOURCE_EXHAUSTED" ||
-    error?.status === "rate_limit_error" ||
-    String(error?.message || "").includes("429") ||
-    /quota|Too Many Requests|RESOURCE_EXHAUSTED|rate limit/i.test(
-      String(error?.message || "")
+    status === "RESOURCE_EXHAUSTED" ||
+    status === "rate_limit_error" ||
+    /quota|Too Many Requests|RESOURCE_EXHAUSTED|rate limit|rate_limit|throttl/i.test(
+      message
     )
   );
 }
@@ -53,11 +54,6 @@ function normalizeModelName(input) {
   const raw = String(input || "").trim();
   if (!raw) return "";
   return raw.replace(/^models\//, "");
-}
-
-function sanitizeProvider(rawProvider) {
-  const value = String(rawProvider || "").trim().toLowerCase();
-  return ALLOWED_PROVIDERS.has(value) ? value : "gemini";
 }
 
 function sanitizeHistory(history) {
@@ -100,15 +96,6 @@ function sanitizeContext(rawContext) {
 
 function jsonError(message, status, extra = {}) {
   return NextResponse.json({ error: message, ...extra }, { status });
-}
-
-function normalizeAnthropicMessages(history, message) {
-  const mappedHistory = history.map((item) => ({
-    role: item.role === "model" ? "assistant" : "user",
-    content: item.parts.map((part) => part.text).join("\n\n"),
-  }));
-
-  return [...mappedHistory, { role: "user", content: message }];
 }
 
 async function authenticateRequest(req, context) {
@@ -184,7 +171,6 @@ export async function POST(req) {
   const message =
     typeof payload?.message === "string" ? payload.message.trim() : "";
   const requestedModel = payload?.model;
-  const requestedProvider = sanitizeProvider(payload?.provider);
   const context = sanitizeContext(payload?.context);
 
   const authResult = await authenticateRequest(req, context);
@@ -202,7 +188,6 @@ export async function POST(req) {
   }
 
   const geminiApiKey = process.env.GEMINI_API_KEY || process.env.GENAI_API_KEY || "";
-  const anthropicApiKey = process.env.ANTHROPIC_API_KEY || "";
   const demoEnv =
     process.env.NEXT_PUBLIC_AI_DEMO === "true" ||
     process.env.AI_DEMO === "1" ||
@@ -213,69 +198,6 @@ export async function POST(req) {
   const geminiModel = ALLOWED_GEMINI_MODELS.has(geminiCandidate)
     ? geminiCandidate
     : "gemini-2.5-flash";
-
-  const anthropicModel =
-    normalizeModelName(requestedModel) ||
-    process.env.ANTHROPIC_MODEL ||
-    "claude-3-5-sonnet-latest";
-
-  if (requestedProvider === "anthropic" && anthropicApiKey) {
-    try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": anthropicApiKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model: anthropicModel,
-          max_tokens: 700,
-          messages: normalizeAnthropicMessages(history, message),
-        }),
-      });
-
-      const data = await response.json().catch(() => ({}));
-      const reply = Array.isArray(data?.content)
-        ? data.content
-            .filter((part) => part?.type === "text")
-            .map((part) => String(part?.text || ""))
-            .join("\n\n")
-            .trim()
-        : "";
-
-      if (response.status === 429) {
-        return NextResponse.json(
-          {
-            error: {
-              code: 429,
-              status: "rate_limit_error",
-              message:
-                data?.error?.message ||
-                "You exceeded your current Claude quota. Shorten prompts or reduce frequency.",
-            },
-            provider: "anthropic",
-            model: anthropicModel,
-          },
-          { status: 429 }
-        );
-      }
-
-      if (response.ok && reply) {
-        return NextResponse.json({
-          reply,
-          provider: "anthropic",
-          model: anthropicModel,
-          role: authResult.auth.role,
-          effectiveScope: authResult.auth.effectiveScope || null,
-        });
-      }
-
-      console.error("Anthropic provider error:", data);
-    } catch (error) {
-      console.error("Anthropic request failed:", error);
-    }
-  }
 
   if (geminiApiKey) {
     try {
@@ -301,7 +223,7 @@ export async function POST(req) {
     } catch (error) {
       const details = extractGeminiError(error);
 
-      if (isQuotaError(details)) {
+      if (isRateLimitError(details)) {
         return NextResponse.json(
           {
             error: {
@@ -309,7 +231,7 @@ export async function POST(req) {
               status: "RESOURCE_EXHAUSTED",
               message:
                 details?.message ||
-                "You exceeded your current quota. Shorten prompts or reduce frequency.",
+                "Gemini temporarily throttled the request. Please try again in a minute.",
             },
             provider: "genai",
             model: geminiModel,
@@ -324,13 +246,10 @@ export async function POST(req) {
 
   if (demoEnv) {
     return NextResponse.json({
-      reply:
-        requestedProvider === "anthropic"
-          ? `Demo Claude: ${message}`
-          : `Demo AI: ${message}`,
+      reply: `Demo AI: ${message}`,
       demo: true,
-      provider: requestedProvider === "anthropic" ? "anthropic-demo" : "demo",
-      model: requestedProvider === "anthropic" ? anthropicModel : geminiModel,
+      provider: "demo",
+      model: geminiModel,
       role: authResult.auth.role,
       effectiveScope: authResult.auth.effectiveScope || null,
     });
@@ -340,11 +259,7 @@ export async function POST(req) {
     const mod = await import("@/lib/firebase/config");
     const firebaseModel = mod?.model;
 
-    if (
-      requestedProvider !== "anthropic" &&
-      firebaseModel &&
-      typeof firebaseModel.generateContent === "function"
-    ) {
+    if (firebaseModel && typeof firebaseModel.generateContent === "function") {
       const result = await firebaseModel.generateContent(message);
       const response = await result.response;
       const reply =
@@ -364,16 +279,9 @@ export async function POST(req) {
     console.warn("Firebase model fallback not available:", error?.message || error);
   }
 
-  if (!geminiApiKey && requestedProvider !== "anthropic") {
+  if (!geminiApiKey) {
     return jsonError(
       "No AI API key configured. Set GEMINI_API_KEY or GENAI_API_KEY in .env.local.",
-      500
-    );
-  }
-
-  if (!anthropicApiKey && requestedProvider === "anthropic") {
-    return jsonError(
-      "Anthropic provider requested but ANTHROPIC_API_KEY is not configured.",
       500
     );
   }

@@ -1,9 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { collection, getDocs, limit, orderBy, query } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
-import { callClaudeAPI, callGeminiAPI } from "@/lib/data/aiRepository";
+import {
+  callGeminiAPI,
+  getAIResponseIssue,
+} from "@/lib/data/aiRepository";
 import { normalizeBriefingPayload } from "@/lib/ai/structuredOutput";
 
 function toDate(value) {
@@ -45,6 +48,21 @@ function truncateText(value, maxLength = 180) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength - 1).trim()}...`;
+}
+
+function areRecentMessageListsEqual(currentMessages = [], nextMessages = []) {
+  if (currentMessages === nextMessages) return true;
+  if (currentMessages.length !== nextMessages.length) return false;
+
+  return currentMessages.every((message, index) => {
+    const nextMessage = nextMessages[index];
+    return (
+      String(message?.id || "") === String(nextMessage?.id || "") &&
+      String(message?.honeycombID || "") === String(nextMessage?.honeycombID || "") &&
+      String(message?.text || "") === String(nextMessage?.text || "") &&
+      toMillis(message?.timestamp) === toMillis(nextMessage?.timestamp)
+    );
+  });
 }
 
 async function loadRecentHiveMessages(hiveID, honeycombs, maxPerRoom = 5, maxMessages = 18) {
@@ -265,6 +283,7 @@ export default function NewMemberBriefPanel({
   entryMode = false,
   onEnterHive = null,
 }) {
+  const autoBriefingTriggeredRef = useRef(false);
   const [briefing, setBriefing] = useState(null);
   const [loadingBriefing, setLoadingBriefing] = useState(false);
   const [asking, setAsking] = useState(false);
@@ -285,6 +304,18 @@ export default function NewMemberBriefPanel({
     () => Object.fromEntries(roomCatalog.map((room) => [String(room.id), room.name || room.id])),
     [roomCatalog]
   );
+
+  useEffect(() => {
+    const fallback = buildFallbackBrief({
+      hiveName,
+      currentUser,
+      rankedDecisions,
+      rankedTasks,
+      roomCatalog,
+    });
+
+    setBriefing((current) => current || fallback);
+  }, [currentUser, hiveName, rankedDecisions, rankedTasks, roomCatalog]);
 
   const selectedDecisions = useMemo(() => {
     if (!briefing?.decisionIds?.length) {
@@ -328,7 +359,9 @@ export default function NewMemberBriefPanel({
       setActiveQuestion("");
 
       const nextMessages = await loadRecentHiveMessages(hiveID, honeycombs);
-      setRecentMessages(nextMessages);
+      setRecentMessages((currentMessages) =>
+        areRecentMessageListsEqual(currentMessages, nextMessages) ? currentMessages : nextMessages
+      );
 
       const nextRankedTasks = buildTaskCatalog(tasks);
       const nextRankedDecisions = buildDecisionCatalog(decisions, tasks, nextMessages);
@@ -413,26 +446,11 @@ Recent messages:
 ${nextMessages.map((message) => `- [${message.honeycombName}] ${message.sender || "User"} (${formatRelativeTime(message.timestamp)}): ${truncateText(message.text, 180)}`).join("\n") || "- none"}
       `.trim();
 
-      let reply = await callClaudeAPI(prompt, {
-        context: {
-          hiveID,
-          feature: "new_member_brief",
-          scope: "hive",
-        },
+      const reply = await callGeminiAPI(prompt, "gemini-2.5-flash", [], {
+        hiveID,
+        feature: "new_member_brief",
+        scope: "hive",
       });
-
-      if (
-        !reply ||
-        /not configured|failed to get|error connecting|authentication required/i.test(
-          String(reply)
-        )
-      ) {
-        reply = await callGeminiAPI(prompt, "gemini-2.5-flash", [], {
-          hiveID,
-          feature: "new_member_brief",
-          scope: "hive",
-        });
-      }
 
       const structured = normalizeBriefingPayload(reply, {
         fallback,
@@ -451,23 +469,28 @@ ${nextMessages.map((message) => `- [${message.honeycombName}] ${message.sender |
       );
     } catch (error) {
       console.error("Failed to build new member briefing:", error);
+      const fallbackRankedTasks = buildTaskCatalog(tasks);
+      const fallbackRankedDecisions = buildDecisionCatalog(decisions, tasks, []);
+      const fallbackRoomCatalog = buildRoomCatalog(honeycombs, fallbackRankedDecisions, []);
       setBriefing(
         buildFallbackBrief({
           hiveName,
           currentUser,
-          rankedDecisions,
-          rankedTasks,
-          roomCatalog,
+          rankedDecisions: fallbackRankedDecisions,
+          rankedTasks: fallbackRankedTasks,
+          roomCatalog: fallbackRoomCatalog,
         })
       );
     } finally {
       setLoadingBriefing(false);
     }
-  }, [currentUser, decisions, hiveID, hiveName, honeycombs, rankedDecisions, rankedTasks, roomCatalog, tasks]);
+  }, [currentUser, decisions, hiveID, hiveName, honeycombs, tasks]);
 
   useEffect(() => {
+    if (!entryMode || autoBriefingTriggeredRef.current) return;
+    autoBriefingTriggeredRef.current = true;
     generateBriefing();
-  }, [generateBriefing]);
+  }, [entryMode, generateBriefing]);
 
   const askQuestion = async (question) => {
     if (!question) return;
@@ -497,29 +520,19 @@ Recent messages:
 ${recentMessages.map((message) => `- [${message.honeycombName}] ${message.sender || "User"}: ${truncateText(message.text, 180)}`).join("\n") || "- none"}
       `.trim();
 
-      let reply = await callClaudeAPI(prompt, {
-        context: {
-          hiveID,
-          feature: "briefing_follow_up",
-          scope: "hive",
-        },
+      const reply = await callGeminiAPI(prompt, "gemini-2.5-flash", [], {
+        hiveID,
+        feature: "briefing_follow_up",
+        scope: "hive",
       });
 
-      if (
-        !reply ||
-        /not configured|failed to get|error connecting|authentication required/i.test(
-          String(reply)
-        )
-      ) {
-        reply = await callGeminiAPI(prompt, "gemini-2.5-flash", [], {
-          hiveID,
-          feature: "briefing_follow_up",
-          scope: "hive",
-        });
-      }
-
+      const issue = getAIResponseIssue(reply);
       setQuestionAnswer(
-        String(reply || "").trim() || "I could not answer that from the current hive context."
+        issue
+          ? issue.kind === "quota"
+            ? "The briefing assistant is temporarily busy because the AI provider hit its rate limit. Try again in a minute."
+            : "I could not answer that from the current hive context."
+          : String(reply || "").trim() || "I could not answer that from the current hive context."
       );
     } catch (error) {
       console.error("Failed to answer briefing follow-up:", error);

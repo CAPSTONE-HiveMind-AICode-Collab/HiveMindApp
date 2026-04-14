@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { deleteDecisionRecord } from "@/lib/data/decisionRepository";
 
 const TIME_OPTIONS = [
   { id: "all", label: "All time" },
@@ -64,6 +65,7 @@ function getDecisionLinkState(record) {
 }
 
 export default function DecisionMemoryPanel({
+  hiveID,
   decisions = [],
   onOpenThread,
   onOpenTasksTab,
@@ -75,6 +77,7 @@ export default function DecisionMemoryPanel({
   const [timeFilter, setTimeFilter] = useState("all");
   const [expandedId, setExpandedId] = useState(null);
   const [localHighlightId, setLocalHighlightId] = useState("");
+  const [removingDecisionId, setRemovingDecisionId] = useState("");
   const decisionTitleMap = useMemo(
     () => new Map(decisions.map((record) => [String(record.id), record.title || "Decision Record"])),
     [decisions]
@@ -142,6 +145,30 @@ export default function DecisionMemoryPanel({
       const el = document.getElementById(`decision-record-${decisionId}`);
       el?.scrollIntoView({ behavior: "smooth", block: "center" });
     });
+  };
+
+  const removeDecision = async (record) => {
+    if (!record?.id || !hiveID) return;
+
+    const confirmed = window.confirm(
+      `Remove "${record.title || "this decision"}" from the decision log?`
+    );
+    if (!confirmed) return;
+
+    try {
+      setRemovingDecisionId(record.id);
+      await deleteDecisionRecord({
+        hiveID,
+        decisionID: record.id,
+      });
+      setExpandedId((current) => (current === record.id ? null : current));
+      setLocalHighlightId((current) => (String(current) === String(record.id) ? "" : current));
+    } catch (error) {
+      console.error("Failed to remove decision record:", error);
+      alert("Could not remove the decision right now.");
+    } finally {
+      setRemovingDecisionId("");
+    }
   };
 
   return (
@@ -337,6 +364,14 @@ export default function DecisionMemoryPanel({
                       className="button-secondary"
                     >
                       Related tasks
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => removeDecision(record)}
+                      disabled={removingDecisionId === record.id}
+                      className="button-ghost"
+                    >
+                      {removingDecisionId === record.id ? "Removing..." : "Remove decision"}
                     </button>
                   </div>
                 </div>

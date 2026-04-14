@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { listenToAuthChanges, signInWithGoogle } from "@/lib/auth/firebaseAuth";
+import BackButton from "@/components/BackButton";
 
 const landingStats = [
   { value: "Trusted", label: "Decision memory" },
@@ -66,6 +67,9 @@ export default function HomePage() {
   return (
     <div className="page-shell">
       <div className="page-frame">
+        <div className="mb-4">
+          <BackButton fallback="/" />
+        </div>
         <section className="hero-panel">
           <div className="eyebrow-grid">
             <span className="hero-chip">Collaborative AI command center</span>

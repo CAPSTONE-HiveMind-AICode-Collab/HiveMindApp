@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 
 import {
   useSendUserMessage,
@@ -18,8 +18,10 @@ import {
 
 import { useUser } from "@/lib/auth/userContext";
 import { callGeminiAPI, askHiveMemory } from "@/lib/data/aiRepository";
-import { NectarRepository } from "@/lib/data/nectarRepository";
-import { buildAskAIContext } from "@/lib/business/contextBuilderService";
+import {
+  buildAskAIContext,
+  resolveScopeForRole,
+} from "@/lib/business/contextBuilderService";
 import { db } from "@/lib/firebase/config";
 import {
   collection,
@@ -28,17 +30,284 @@ import {
   doc,
   onSnapshot,
   getDocs,
+  updateDoc,
 } from "firebase/firestore";
 
 import { checkPermission } from "@/lib/business/permissionService";
-import { listThreadSummaries } from "@/lib/data/summaryRepository";
+import {
+  buildThreadSummaryFromConversation,
+  listThreadSummaries,
+} from "@/lib/data/summaryRepository";
 
 import CodeBlock from "@/components/CodeBlock";
 import FileUploader from "@/components/fileUploader";
 import AttachmentList from "@/components/attachmentList";
+import DeveloperSandboxWorkspace from "@/components/DeveloperSandboxWorkspace";
 
 import CreateTaskModal from "@/components/CreateTaskModal";
+import LogDecisionModal from "@/components/LogDecisionModal";
 import { createTaskFromMessage } from "@/lib/data/taskRepository";
+import { normalizeChatCitationPayload } from "@/lib/ai/structuredOutput";
+import { normalizeSandboxConfig } from "@/lib/sandbox/config";
+import { extractFileReferences } from "@/lib/sandbox/codeBlocks";
+import { listSandboxFiles } from "@/lib/data/sandboxRepository";
+import {
+  createDecisionRecord,
+  DECISION_STATUSES,
+} from "@/lib/data/decisionRepository";
+
+const DEFAULT_AI_MODEL = "gemini-2.5-flash";
+const ROOM_TABS = [
+  { id: "chat", label: "Chat" },
+  { id: "decisions", label: "Decisions" },
+  { id: "tasks", label: "Tasks" },
+  { id: "sandbox", label: "Sandbox" },
+  { id: "files", label: "Files" },
+];
+const CLOSED_TASK_STATUSES = new Set([
+  "done",
+  "closed",
+  "complete",
+  "completed",
+  "archived",
+  "cancelled",
+  "canceled",
+]);
+const DEFAULT_TASK_MODAL_PRESENTATION = {
+  titleOverride: "Create task from message",
+  subtitleOverride:
+    "Turn this chat context into tracked work, assign owners, and keep it connected to the decision trail.",
+  submitLabel: "Create task",
+};
+const DEFAULT_DECISION_MODAL_PRESENTATION = {
+  titleOverride: "Log decision from message",
+  subtitleOverride: "Confirm the final call before it becomes part of the hive's long-term memory.",
+  submitLabel: "Log decision",
+};
+const INCIDENT_PATTERNS = [
+  /\b502\b/i,
+  /\b503\b/i,
+  /\b404\b/i,
+  /\bdown\b/i,
+  /\bbroken\b/i,
+  /\berror\b/i,
+  /\bcrash\b/i,
+  /\bfailing\b/i,
+  /\boutage\b/i,
+  /\bnot working\b/i,
+  /\bproduction issue\b/i,
+  /\bp0\b/i,
+  /\bp1\b/i,
+  /\bincident\b/i,
+];
+
+function truncateText(value, maxLength = 96) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 1).trim()}...`;
+}
+
+function matchesIncident(text) {
+  return INCIDENT_PATTERNS.some((pattern) => pattern.test(String(text || "")));
+}
+
+function hasCodeBlock(text) {
+  return /```[\s\S]*?```/.test(String(text || ""));
+}
+
+function looksLikeStackTrace(text) {
+  return /(^|\n)\s*at\s.+/m.test(String(text || "")) || /\b(?:Error|Exception):/m.test(String(text || ""));
+}
+
+function looksLikeDiff(text) {
+  return /(^|\n)(@@|\+\+\+|---|\+[^\s+]|-[^\s-])/m.test(String(text || ""));
+}
+
+function normalizeRepoFilePath(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "");
+}
+
+function normalizeLinkedRepoFileEntry(entry) {
+  if (typeof entry === "string") {
+    return normalizeRepoFilePath(entry);
+  }
+
+  if (entry && typeof entry === "object") {
+    return normalizeRepoFilePath(entry.path || entry.filePath || entry.name || "");
+  }
+
+  return "";
+}
+
+function getFileBasename(filePath) {
+  const normalized = normalizeRepoFilePath(filePath);
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] || normalized;
+}
+
+function buildMessageFileReferences(message) {
+  const storedMentions = Array.isArray(message?.fileMentions)
+    ? message.fileMentions.map(normalizeLinkedRepoFileEntry).filter(Boolean)
+    : [];
+  const merged = [...new Set([...storedMentions, ...extractFileReferences(message?.text)])];
+
+  return merged.filter((candidate) => {
+    if (candidate.includes("/")) {
+      return true;
+    }
+
+    return !merged.some(
+      (other) => other !== candidate && other.includes("/") && other.endsWith(`/${candidate}`)
+    );
+  });
+}
+
+function getComposerFileContext(text, caretPosition) {
+  const value = String(text || "");
+  const safeCaret = Number.isInteger(caretPosition)
+    ? Math.max(0, Math.min(caretPosition, value.length))
+    : value.length;
+
+  const beforeCaret = value.slice(0, safeCaret);
+  const tokenStart =
+    Math.max(
+      beforeCaret.lastIndexOf(" "),
+      beforeCaret.lastIndexOf("\n"),
+      beforeCaret.lastIndexOf("\t")
+    ) + 1;
+  const rawToken = beforeCaret.slice(tokenStart);
+  const strippedToken = rawToken
+    .replace(/^`+/, "")
+    .replace(/[`,;:!?()[\]{}]+$/g, "")
+    .trim();
+
+  if (!strippedToken) {
+    return null;
+  }
+
+  const explicitTrigger = strippedToken.startsWith("@");
+  const query = normalizeRepoFilePath(
+    explicitTrigger ? strippedToken.slice(1) : strippedToken
+  ).toLowerCase();
+
+  // Only open file suggestions when the user explicitly types a file mention.
+  if (!explicitTrigger) {
+    return null;
+  }
+
+  if (!query) {
+    return null;
+  }
+
+  return {
+    query,
+    replaceStart: tokenStart,
+    replaceEnd: safeCaret,
+  };
+}
+
+function damerauLevenshteinDistance(left, right) {
+  const a = String(left || "");
+  const b = String(right || "");
+
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+
+  const rows = Array.from({ length: a.length + 1 }, () =>
+    Array(b.length + 1).fill(0)
+  );
+
+  for (let row = 0; row <= a.length; row += 1) {
+    rows[row][0] = row;
+  }
+
+  for (let column = 0; column <= b.length; column += 1) {
+    rows[0][column] = column;
+  }
+
+  for (let row = 1; row <= a.length; row += 1) {
+    for (let column = 1; column <= b.length; column += 1) {
+      const cost = a[row - 1] === b[column - 1] ? 0 : 1;
+
+      rows[row][column] = Math.min(
+        rows[row - 1][column] + 1,
+        rows[row][column - 1] + 1,
+        rows[row - 1][column - 1] + cost
+      );
+
+      if (
+        row > 1 &&
+        column > 1 &&
+        a[row - 1] === b[column - 2] &&
+        a[row - 2] === b[column - 1]
+      ) {
+        rows[row][column] = Math.min(rows[row][column], rows[row - 2][column - 2] + cost);
+      }
+    }
+  }
+
+  return rows[a.length][b.length];
+}
+
+function getFuzzyFileScore(filePath, query) {
+  const normalizedPath = normalizeRepoFilePath(filePath).toLowerCase();
+  const baseName = getFileBasename(filePath).toLowerCase();
+  const segments = normalizedPath.split("/").filter(Boolean);
+  const candidates = [baseName, normalizedPath, ...segments];
+
+  let bestScore = 0;
+
+  for (const candidate of candidates) {
+    const slice = candidate.slice(0, Math.max(query.length + 2, query.length));
+    const distance = damerauLevenshteinDistance(query, slice || candidate);
+    const ratio = 1 - distance / Math.max(query.length, slice.length || 1);
+
+    if (distance <= 1) {
+      bestScore = Math.max(bestScore, 58);
+    } else if (distance === 2) {
+      bestScore = Math.max(bestScore, 46);
+    } else if (ratio >= 0.72) {
+      bestScore = Math.max(bestScore, 38);
+    }
+  }
+
+  return bestScore;
+}
+
+function scoreFileSuggestion(filePath, query) {
+  const normalizedPath = normalizeRepoFilePath(filePath).toLowerCase();
+  const baseName = getFileBasename(filePath).toLowerCase();
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+
+  if (!normalizedQuery) return 20;
+  if (normalizedPath === normalizedQuery || baseName === normalizedQuery) return 100;
+  if (baseName.startsWith(normalizedQuery)) return 90;
+  if (normalizedPath.startsWith(normalizedQuery)) return 80;
+  if (baseName.includes(normalizedQuery)) return 60;
+  if (normalizedPath.includes(normalizedQuery)) return 40;
+  return getFuzzyFileScore(filePath, normalizedQuery);
+}
+
+function getComposerFileSuggestions(files, query, limit = 8) {
+  return [...new Set(Array.isArray(files) ? files.map(normalizeLinkedRepoFileEntry) : [])]
+    .map((filePath) => ({
+      filePath,
+      score: scoreFileSuggestion(filePath, query),
+    }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+
+      return left.filePath.localeCompare(right.filePath);
+    })
+    .slice(0, limit)
+    .map((item) => item.filePath);
+}
 
 function toTitleCase(value) {
   return String(value || "")
@@ -47,32 +316,128 @@ function toTitleCase(value) {
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+function formatStamp(value) {
+  if (!value) return "just now";
+  const date = value?.toDate ? value.toDate() : new Date(value);
+  if (Number.isNaN(date.getTime())) return "just now";
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function firstMeaningfulLine(value, fallback = "Decision Record") {
+  return (
+    String(value || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) || fallback
+  );
+}
+
+function tokenize(value) {
+  return String(value || "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3);
+}
+
+function scoreDecisionMatch(record, text) {
+  const queryTokens = tokenize(text);
+  if (!queryTokens.length) return 0;
+
+  const searchable = [
+    record.title,
+    record.summary,
+    record.decision,
+    record.rationale,
+    ...(Array.isArray(record.tags) ? record.tags : []),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  return queryTokens.reduce((score, token) => {
+    return score + (searchable.includes(token) ? 1 : 0);
+  }, 0);
+}
+
+function findRelevantDecisions(records, text) {
+  if (!Array.isArray(records) || !text) return [];
+
+  return records
+    .map((record) => ({ record, score: scoreDecisionMatch(record, text) }))
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 2)
+    .map((item) => item.record);
+}
+
+function formatDecisionCitation(record) {
+  const title = record.title || "Decision";
+  const room = record.honeycombID || record.source?.honeycombID || "unknown-room";
+  const source = record.parentMessageID || record.source?.parentMessageID || "source";
+  return `${title} | ${room} | ${source}`;
+}
+
+function ensureDecisionCitation(reply, matchedDecisions) {
+  const text = String(reply || "").trim();
+  if (!text || !matchedDecisions.length) return text;
+  if (/^Citation:/im.test(text)) return text;
+
+  const referencesPastContext = /(past|previous|similar|before|earlier|decision|incident)/i.test(
+    text
+  );
+
+  if (!referencesPastContext) return text;
+
+  return `${text}\n\nCitation: [${matchedDecisions
+    .map(formatDecisionCitation)
+    .join("] [")}]`;
+}
+
+function buildChatReplyWithCitations(rawReply, matchedDecisions) {
+  const parsed = normalizeChatCitationPayload(
+    rawReply,
+    matchedDecisions.map((decision) => decision.id)
+  );
+  if (!parsed) {
+    return ensureDecisionCitation(rawReply, matchedDecisions);
+  }
+
+  const answer = String(parsed.answer || parsed.reply || "").trim();
+  const citedDecisions = Array.isArray(parsed.citationDecisionIds)
+    ? parsed.citationDecisionIds
+        .map((decisionId) =>
+          matchedDecisions.find((record) => String(record.id) === String(decisionId))
+        )
+        .filter(Boolean)
+    : [];
+
+  if (!citedDecisions.length) {
+    return answer || ensureDecisionCitation(rawReply, matchedDecisions);
+  }
+
+  return `${answer}\n\nCitation: [${citedDecisions.map(formatDecisionCitation).join("] [")}]`;
+}
+
+
 export default function HoneycombChatPage() {
   const params = useParams();
+  const searchParams = useSearchParams();
   const hiveID = String(params?.hiveID ?? "");
   const honeycombID = String(params?.honeycombID ?? "");
+  const requestedThreadMessageID = String(searchParams?.get("thread") ?? "");
 
   const router = useRouter();
   const { user, loading } = useUser();
 
   const [message, setMessage] = useState("");
-  // queued attachments (upload now, send later)
   const [pendingAttachments, setPendingAttachments] = useState([]);
-  const [uploadState, setUploadState] = useState({
-    busy: false,
-    phase: "idle",
-    progress: 0,
-  });
-
-  const [selectedModel, setSelectedModel] = useState(
-    process.env.NEXT_PUBLIC_DEFAULT_MODEL ||
-      (typeof window !== "undefined"
-        ? window?.GEMINI_MODEL || process.env.GEMINI_MODEL
-        : "gemini-2.5-flash")
-  );
-
-  const [aiScope, setAiScope] = useState("message");
-  const [allowAIDecrypt, setAllowAIDecrypt] = useState(false);
+  const [aiScope, setAiScope] = useState("last_5");
   const [messages, setMessages] = useState([]);
   const [threads, setThreads] = useState({});
   const [loadingAI, setLoadingAI] = useState(false);
@@ -81,6 +446,24 @@ export default function HoneycombChatPage() {
   const [userRole, setUserRole] = useState(null);
   const [userRoles, setUserRoles] = useState({});
   const [userColors, setUserColors] = useState({});
+  const [memberDirectory, setMemberDirectory] = useState([]);
+  const [decisionRecords, setDecisionRecords] = useState([]);
+  const [taskRecords, setTaskRecords] = useState([]);
+  const [hiveMeta, setHiveMeta] = useState(null);
+  const [roomMeta, setRoomMeta] = useState(null);
+  const [activeSubtab, setActiveSubtab] = useState("chat");
+  const [sandboxLayoutMode, setSandboxLayoutMode] = useState("split");
+  const [linkedRepoFiles, setLinkedRepoFiles] = useState([]);
+  const [composerFileSuggestions, setComposerFileSuggestions] = useState([]);
+  const [composerFilePicker, setComposerFilePicker] = useState({
+    open: false,
+    query: "",
+    replaceStart: 0,
+    replaceEnd: 0,
+    selectedIndex: 0,
+  });
+  const [composerFilesLoading, setComposerFilesLoading] = useState(false);
+  const [composerFilesError, setComposerFilesError] = useState("");
 
   const [summaries, setSummaries] = useState([]);
   const [summariesLoading, setSummariesLoading] = useState(true);
@@ -97,16 +480,190 @@ export default function HoneycombChatPage() {
   const recognitionRef = useRef(null);
 
   const messagesEndRef = useRef(null);
+  const requestedThreadHandledRef = useRef(false);
+  const messageInputRef = useRef(null);
+  const pendingJumpToLatestChatRef = useRef(false);
 
   // Task modal state
   const [taskModalOpen, setTaskModalOpen] = useState(false);
   const [taskSourceMsg, setTaskSourceMsg] = useState(null);
+  const [taskModalAttachmentText, setTaskModalAttachmentText] = useState("");
+  const [taskModalPresentation, setTaskModalPresentation] = useState(
+    DEFAULT_TASK_MODAL_PRESENTATION
+  );
+  const [decisionModalOpen, setDecisionModalOpen] = useState(false);
+  const [decisionSourceMsg, setDecisionSourceMsg] = useState(null);
+  const [decisionModalMessageText, setDecisionModalMessageText] = useState("");
+  const [decisionModalPresentation, setDecisionModalPresentation] = useState(
+    DEFAULT_DECISION_MODAL_PRESENTATION
+  );
+  const [loggingDecisionId, setLoggingDecisionId] = useState("");
+  const [sandboxLaunchRequest, setSandboxLaunchRequest] = useState({
+    sourceId: "",
+    targetFilePath: "",
+  });
 
   const sendUserMessage = useSendUserMessage();
   const sendThreadMessage = useSendThreadMessage();
 
   /* ----------------- PERMISSION HELPER ----------------- */
   const canChat = userRole ? checkPermission(userRole, "SEND_MESSAGE") : true;
+  const sandboxConfig = normalizeSandboxConfig(roomMeta?.sandbox || {});
+  const sandboxAllowedPathsKey = sandboxConfig.allowedPaths.join("|");
+
+  useEffect(() => {
+    setAiScope((currentScope) =>
+      resolveScopeForRole(currentScope || "last_5", userRole)
+    );
+  }, [userRole]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadLinkedRepoFiles() {
+      if (!user?.uid || !hiveID || !honeycombID) {
+        return;
+      }
+
+      if (!sandboxConfig.linkedProjectPath) {
+        setLinkedRepoFiles([]);
+        setComposerFilesLoading(false);
+        setComposerFilesError("");
+        return;
+      }
+
+      setComposerFilesLoading(true);
+      setComposerFilesError("");
+
+      try {
+        const response = await listSandboxFiles({
+          hiveID,
+          honeycombID,
+          linkedProjectPath: sandboxConfig.linkedProjectPath,
+          allowedPaths: sandboxConfig.allowedPaths,
+        });
+
+        if (!cancelled) {
+          setLinkedRepoFiles(
+            Array.isArray(response?.files)
+              ? response.files
+                  .map(normalizeLinkedRepoFileEntry)
+                  .filter(Boolean)
+              : []
+          );
+        }
+      } catch (error) {
+        console.error("Failed to load linked repo files for chat composer:", error);
+
+        if (!cancelled) {
+          setLinkedRepoFiles([]);
+          setComposerFilesError(
+            String(error?.message || "Could not load repo files for chat suggestions.")
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setComposerFilesLoading(false);
+        }
+      }
+    }
+
+    loadLinkedRepoFiles();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hiveID, honeycombID, user?.uid, sandboxConfig.linkedProjectPath, sandboxAllowedPathsKey]);
+
+  const updateComposerFilePicker = useCallback(
+    (nextValue, caretPosition) => {
+      if (!sandboxConfig.linkedProjectPath || !canChat) {
+        setComposerFileSuggestions([]);
+        setComposerFilePicker((current) =>
+          current.open || current.query
+            ? {
+                open: false,
+                query: "",
+                replaceStart: 0,
+                replaceEnd: 0,
+                selectedIndex: 0,
+              }
+            : current
+        );
+        return;
+      }
+
+      const context = getComposerFileContext(nextValue, caretPosition);
+      if (!context) {
+        setComposerFileSuggestions([]);
+        setComposerFilePicker((current) =>
+          current.open || current.query
+            ? {
+                open: false,
+                query: "",
+                replaceStart: 0,
+                replaceEnd: 0,
+                selectedIndex: 0,
+              }
+            : current
+        );
+        return;
+      }
+
+      const nextSuggestions = getComposerFileSuggestions(
+        linkedRepoFiles,
+        context.query
+      );
+
+      if (!nextSuggestions.length) {
+        setComposerFileSuggestions([]);
+        setComposerFilePicker({
+          open: false,
+          query: context.query,
+          replaceStart: context.replaceStart,
+          replaceEnd: context.replaceEnd,
+          selectedIndex: 0,
+        });
+        return;
+      }
+
+      setComposerFileSuggestions(nextSuggestions);
+      setComposerFilePicker((current) => ({
+        open: true,
+        query: context.query,
+        replaceStart: context.replaceStart,
+        replaceEnd: context.replaceEnd,
+        selectedIndex:
+          current.query === context.query
+            ? Math.min(current.selectedIndex, nextSuggestions.length - 1)
+            : 0,
+      }));
+    },
+    [canChat, linkedRepoFiles, sandboxConfig.linkedProjectPath]
+  );
+
+  const closeComposerFilePicker = useCallback(() => {
+    setComposerFileSuggestions([]);
+    setComposerFilePicker({
+      open: false,
+      query: "",
+      replaceStart: 0,
+      replaceEnd: 0,
+      selectedIndex: 0,
+    });
+  }, []);
+
+  const composerMentionedFiles = buildMessageFileReferences({ text: message });
+
+  useEffect(() => {
+    if (!message) {
+      closeComposerFilePicker();
+      return;
+    }
+
+    const caretPosition = messageInputRef.current?.selectionStart ?? message.length;
+    updateComposerFilePicker(message, caretPosition);
+  }, [message, linkedRepoFiles, updateComposerFilePicker, closeComposerFilePicker]);
 
   /* ----------------- COLORS & ROLE EMOJI ----------------- */
   const getUserColor = (userId) => {
@@ -132,46 +689,33 @@ export default function HoneycombChatPage() {
   };
 
   const normalizeAttachments = (msg) => {
-  const raw =
-    msg?.attachment ??
-    msg?.attachments ??
-    msg?.files ??
-    msg?.file ??
-    msg?.meta ??
-    null;
+    const raw =
+      msg?.attachment ??
+      msg?.attachments ??
+      msg?.files ??
+      msg?.file ??
+      msg?.meta ??
+      null;
 
-  if (!raw) return [];
-  const arr = Array.isArray(raw) ? raw : [raw];
+    if (!raw) return [];
+    const arr = Array.isArray(raw) ? raw : [raw];
 
-  return arr
-    .filter(Boolean)
-    .map((a) => ({
-      ...a,
-      name:
-        a.name ??
-        a.filename ??
-        a.originalName ??
-        (typeof a.path === "string" ? a.path.split("/").pop() : undefined) ??
-        "file",
-      url: a.url ?? a.downloadURL ?? a.downloadUrl ?? a.storageUrl ?? "",
-      contentType: a.contentType ?? a.type ?? a.mimeType ?? "unknown",
-      size: a.size ?? a.bytes ?? a.fileSize ?? 0,
-
-      text: a.text ?? "",
-      extractedText: a.extractedText ?? "",
-      imageDescription: a.imageDescription ?? "",
-
-      rawCaption: a.rawCaption ?? "",
-      captionRisk: a.captionRisk ?? "",
-      captionNotes: Array.isArray(a.captionNotes) ? a.captionNotes : [],
-
-      extractionMethod: a.extractionMethod ?? "",
-      extractionStatus: a.extractionStatus ?? "",
-      extractionError: a.extractionError ?? "",
-      isDocumentLike: !!a.isDocumentLike,
-      ocrConfidence: a.ocrConfidence ?? null,
-    }));
-};
+    return arr
+      .filter(Boolean)
+      .map((a) => ({
+        ...a,
+        name:
+          a.name ??
+          a.filename ??
+          a.originalName ??
+          (typeof a.path === "string" ? a.path.split("/").pop() : undefined) ??
+          "file",
+        url: a.url ?? a.downloadURL ?? a.downloadUrl ?? a.storageUrl ?? "",
+        contentType: a.contentType ?? a.type ?? a.mimeType ?? "unknown",
+        size: a.size ?? a.bytes ?? a.fileSize ?? 0,
+        text: a.text ?? "",
+      }));
+  };
 
   const getRoleEmoji = (role) => {
     const roleMap = {
@@ -195,7 +739,12 @@ const handleSearchMemory = async (e) => {
   setIsSearchingMemory(true);
   setMemoryResponse("");
   try {
-    const answer = await askHiveMemory(hiveID, memoryQuery, selectedModel);
+    const answer = await askHiveMemory(hiveID, memoryQuery, DEFAULT_AI_MODEL, {
+      hiveID,
+      honeycombID,
+      scope: resolveScopeForRole("message", userRole),
+      feature: "memory_query",
+    });
     setMemoryResponse(answer);
   } catch (err) {
     console.error("Memory search failed:", err);
@@ -284,6 +833,38 @@ const handleSearchMemory = async (e) => {
     loadSummaries();
   }, [loadSummaries]);
 
+  useEffect(() => {
+    if (!hiveID || !honeycombID) return;
+
+    const hiveRef = doc(db, "Hive", String(hiveID));
+    const roomRef = doc(db, "Hive", String(hiveID), "Honeycomb", String(honeycombID));
+
+    const unsubscribeHive = onSnapshot(
+      hiveRef,
+      (snapshot) => {
+        setHiveMeta(snapshot.exists() ? snapshot.data() : null);
+      },
+      (error) => {
+        console.error("Failed to load hive metadata:", error);
+      }
+    );
+
+    const unsubscribeRoom = onSnapshot(
+      roomRef,
+      (snapshot) => {
+        setRoomMeta(snapshot.exists() ? snapshot.data() : null);
+      },
+      (error) => {
+        console.error("Failed to load room metadata:", error);
+      }
+    );
+
+    return () => {
+      unsubscribeHive();
+      unsubscribeRoom();
+    };
+  }, [hiveID, honeycombID]);
+
   /* ----------------- LOAD USER ROLE FOR HIVE (real-time) ----------------- */
   useEffect(() => {
     if (!user || !hiveID) return;
@@ -312,10 +893,17 @@ const handleSearchMemory = async (e) => {
         const membersRef = collection(db, "Hive", hiveID, "members");
         const snap = await getDocs(membersRef);
         const roles = {};
+        const memberList = snap.docs.map((d) => ({
+          uid: d.id,
+          ...d.data(),
+        }));
         snap.docs.forEach((d) => {
           roles[d.id] = d.data()?.role;
         });
-        if (!cancelled) setUserRoles(roles);
+        if (!cancelled) {
+          setUserRoles(roles);
+          setMemberDirectory(memberList);
+        }
       },
       (err) => {
         console.error("Failed to load user role for hive:", err);
@@ -331,6 +919,38 @@ const handleSearchMemory = async (e) => {
       unsubscribe();
     };
   }, [user, hiveID, honeycombID, router]);
+
+  useEffect(() => {
+    if (!hiveID) return;
+
+    const decisionsRef = collection(db, "Hive", hiveID, "decisionRecords");
+    const tasksRef = collection(db, "Hive", hiveID, "tasks");
+
+    const unsubscribeDecisions = onSnapshot(
+      decisionsRef,
+      (snapshot) => {
+        setDecisionRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      },
+      (error) => {
+        console.error("Failed to load decision records:", error);
+      }
+    );
+
+    const unsubscribeTasks = onSnapshot(
+      tasksRef,
+      (snapshot) => {
+        setTaskRecords(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+      },
+      (error) => {
+        console.error("Failed to load tasks:", error);
+      }
+    );
+
+    return () => {
+      unsubscribeDecisions();
+      unsubscribeTasks();
+    };
+  }, [hiveID]);
 
   /* ----------------- MAIN CHAT SUBSCRIPTION ----------------- */
   useEffect(() => {
@@ -467,6 +1087,12 @@ const handleSearchMemory = async (e) => {
     }
   };
 
+  const jumpToLatestRoomChat = useCallback(() => {
+    pendingJumpToLatestChatRef.current = true;
+    setSearchQuery("");
+    setActiveSubtab("chat");
+  }, []);
+
   /* ----------------- AUTO-SCROLL ----------------- */
   useEffect(() => {
     if (searchQuery) return;
@@ -478,84 +1104,160 @@ const handleSearchMemory = async (e) => {
     }
   }, [messages, searchQuery, loadingOlderMessages]);
 
+  useEffect(() => {
+    if (activeSubtab !== "chat" || !pendingJumpToLatestChatRef.current) {
+      return undefined;
+    }
+
+    let frameOne = 0;
+    let frameTwo = 0;
+
+    frameOne = window.requestAnimationFrame(() => {
+      frameTwo = window.requestAnimationFrame(() => {
+        messagesEndRef.current?.scrollIntoView({
+          behavior: "smooth",
+          block: "end",
+        });
+        pendingJumpToLatestChatRef.current = false;
+      });
+    });
+
+    return () => {
+      if (frameOne) {
+        window.cancelAnimationFrame(frameOne);
+      }
+      if (frameTwo) {
+        window.cancelAnimationFrame(frameTwo);
+      }
+    };
+  }, [activeSubtab, messages.length]);
+
 
   /* ----------------- FILE UPLOAD (QUEUE ONLY) ----------------- */
   const handleFileUploaded = async (meta) => {
-  if (!canChat) {
-    alert("You have view-only access in this hive and cannot upload files.");
-    return;
-  }
+    if (!canChat) {
+      alert("You have view-only access in this hive and cannot upload files.");
+      return;
+    }
 
-  const arr = Array.isArray(meta) ? meta : meta ? [meta] : [];
-  if (arr.length === 0) return;
+    const arr = Array.isArray(meta) ? meta : meta ? [meta] : [];
+    if (arr.length === 0) return;
 
-  setPendingAttachments((prev) => [...prev, ...arr]);
-};
+    // queue it; don't send message yet
+    setPendingAttachments((prev) => [...prev, ...arr]);
+  };
+
+  const applyComposerFileSuggestion = useCallback(
+    (filePath) => {
+      const normalizedPath = normalizeRepoFilePath(filePath);
+      if (!normalizedPath) return;
+
+      const input = messageInputRef.current;
+      const selectionStart =
+        composerFilePicker.replaceStart ?? input?.selectionStart ?? message.length;
+      const selectionEnd =
+        composerFilePicker.replaceEnd ?? input?.selectionEnd ?? message.length;
+      const needsTrailingSpace = selectionEnd >= message.length;
+      const nextValue = [
+        message.slice(0, selectionStart),
+        normalizedPath,
+        needsTrailingSpace ? " " : "",
+        message.slice(selectionEnd),
+      ].join("");
+      const nextCaretPosition = selectionStart + normalizedPath.length + (needsTrailingSpace ? 1 : 0);
+
+      setMessage(nextValue);
+      closeComposerFilePicker();
+
+      requestAnimationFrame(() => {
+        input?.focus();
+        input?.setSelectionRange(nextCaretPosition, nextCaretPosition);
+      });
+    },
+    [closeComposerFilePicker, composerFilePicker.replaceEnd, composerFilePicker.replaceStart, message]
+  );
+
+  const handleMessageInputChange = (e) => {
+    const nextValue = e.target.value;
+    setMessage(nextValue);
+    updateComposerFilePicker(nextValue, e.target.selectionStart ?? nextValue.length);
+  };
+
+  const handleMessageInputKeyDown = (e) => {
+    if (!composerFilePicker.open || !composerFileSuggestions.length) {
+      return;
+    }
+
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setComposerFilePicker((current) => ({
+        ...current,
+        selectedIndex: (current.selectedIndex + 1) % composerFileSuggestions.length,
+      }));
+      return;
+    }
+
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setComposerFilePicker((current) => ({
+        ...current,
+        selectedIndex:
+          (current.selectedIndex - 1 + composerFileSuggestions.length) %
+          composerFileSuggestions.length,
+      }));
+      return;
+    }
+
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      applyComposerFileSuggestion(
+        composerFileSuggestions[composerFilePicker.selectedIndex] ||
+          composerFileSuggestions[0]
+      );
+      return;
+    }
+
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeComposerFilePicker();
+    }
+  };
 
   /* ----------------- SEND MESSAGE (TEXT + QUEUED FILES) ----------------- */
   const handleSendMessage = async (e) => {
-  e.preventDefault();
+    e.preventDefault();
 
-  if (!canChat) {
-    alert("You have view-only access in this hive and cannot send messages.");
-    return;
-  }
+    if (!canChat) {
+      alert("You have view-only access in this hive and cannot send messages.");
+      return;
+    }
 
-  if (uploadState.busy) {
-    alert("Please wait for the file upload to finish before sending.");
-    return;
-  }
+    const text = message.trim();
+    const hasAttachments = pendingAttachments.length > 0;
 
-  const text = message.trim();
-  const hasAttachments = pendingAttachments.length > 0;
+    //  allow attachments-only
+    if (!text && !hasAttachments) return;
 
-  if (!text && !hasAttachments) return;
+    try {
+      await sendUserMessage(text, hiveID, honeycombID, [], pendingAttachments, {
+        fileMentions: composerMentionedFiles,
+      });
 
-  try {
-    const attachmentsToSend = pendingAttachments.map((a) => ({
-      name: a?.name || "",
-      size: a?.size || 0,
-      contentType: a?.contentType || "application/octet-stream",
-      url: a?.url || "",
-      storagePath: a?.storagePath || "",
-      uploadedAt: a?.uploadedAt || Date.now(),
+      // reset composer
+      setMessage("");
+      setPendingAttachments([]);
+      closeComposerFilePicker();
 
-      text: a?.text || null,
-      extractedText: a?.extractedText || null,
-      imageDescription: a?.imageDescription || null,
-
-      rawCaption: a?.rawCaption || null,
-      captionRisk: a?.captionRisk || null,
-      captionNotes: Array.isArray(a?.captionNotes) ? a.captionNotes : [],
-
-      extractionMethod: a?.extractionMethod || null,
-      extractionStatus: a?.extractionStatus || null,
-      extractionError: a?.extractionError || null,
-      isDocumentLike: !!a?.isDocumentLike,
-      ocrConfidence: a?.ocrConfidence ?? null,
-    }));
-
-    await sendUserMessage(
-      text,
-      hiveID,
-      honeycombID,
-      [],
-      attachmentsToSend
-    );
-
-    setMessage("");
-    setPendingAttachments([]);
-
-    const unreadCount = await getHoneycombUnreadCount(
-      hiveID,
-      honeycombID,
-      user.uid
-    );
-    setUnreadMessageCount(unreadCount);
-  } catch (err) {
-    console.error("Send message failed:", err);
-  }
-};
+      const unreadCount = await getHoneycombUnreadCount(
+        hiveID,
+        honeycombID,
+        user.uid
+      );
+      setUnreadMessageCount(unreadCount);
+    } catch (err) {
+      console.error("Send message failed:", err);
+    }
+  };
 
   /* ----------------- SEND THREAD MESSAGE ----------------- */
   const handleSendThread = async (text, parentMessageID) => {
@@ -582,201 +1284,226 @@ const handleSearchMemory = async (e) => {
     }
   };
 
-/* ----------------- AI REPLY (scoped context + attachments + privacy) ----------------- */
-const handleAIReply = async (msgOrText, scope = "message") => {
-  const msg =
-    typeof msgOrText === "object" && msgOrText !== null
-      ? msgOrText
-      : { text: String(msgOrText ?? ""), attachment: null };
+  /* ----------------- AI REPLY (context + attachments) ----------------- */
+    /* ----------------- AI REPLY (scoped context + attachments + privacy) ----------------- */
+  const handleAIReply = async (msgOrText, scope = "message") => {
+    const msg =
+      typeof msgOrText === "object" && msgOrText !== null
+        ? msgOrText
+        : { text: String(msgOrText ?? ""), attachment: null };
+    const effectiveScope = resolveScopeForRole(scope, userRole);
 
-  if (!canChat) {
-    alert("You have view-only access in this hive and cannot use AI features.");
-    return;
-  }
-
-  try {
-    setLoadingAI(true);
-
-    const attachments = normalizeAttachments(msg);
-    const MAX_ATTACHMENT_CHARS_TO_AI = 8000;
-
-    const hasExtractedAttachmentText = attachments.some(
-      (a) => String(a?.extractedText || a?.text || "").trim().length > 0
-    );
-    const hasDocumentWithoutText = attachments.some(
-      (a) => a?.isDocumentLike && !String(a?.extractedText || a?.text || "").trim()
-    );
-
-    const attachmentPolicy =
-      attachments.length > 0
-        ? `You are analyzing chat attachments.
-If extracted OCR text or document text is present, base your answer primarily on that text.
-Summarize what the text says, identify important fields, and answer the user's question from the extracted text.
-Only use image description as fallback context when no extracted text is available.
-Do not invent identities, emotions, events, locations, or storylines beyond the stored attachment data.
-If a caption is marked as low/medium/high reliability, treat it cautiously and do not embellish.
-If the attachment looks document-like but no text was extracted, say clearly that OCR/text extraction was unavailable or failed.`
-        : "";
-
-    const attachmentTextBlock = attachments
-      .map((a) => {
-        const parts = [];
-
-        if (a.extractedText) {
-          const sliced = a.extractedText.slice(0, MAX_ATTACHMENT_CHARS_TO_AI);
-          const truncated =
-            a.extractedText.length > MAX_ATTACHMENT_CHARS_TO_AI
-              ? "\n\n[TRUNCATED]"
-              : "";
-          parts.push(
-            `Extracted OCR text (${a.name || "image"}):\n${sliced}${truncated}`
-          );
-        } else if (a.text && !a.imageDescription) {
-          const sliced = a.text.slice(0, MAX_ATTACHMENT_CHARS_TO_AI);
-          const truncated =
-            a.text.length > MAX_ATTACHMENT_CHARS_TO_AI
-              ? "\n\n[TRUNCATED]"
-              : "";
-          parts.push(
-            `Attached text content (${a.name || "file"}):\n${sliced}${truncated}`
-          );
-        }
-
-        if (a.imageDescription) {
-          parts.push(
-            `Safer image description (${a.name || "image"}): ${a.imageDescription}`
-          );
-        }
-
-        if (
-          a.rawCaption &&
-          a.rawCaption !== a.imageDescription &&
-          a.captionRisk === "low"
-        ) {
-          parts.push(
-            `Raw model caption (${a.name || "image"}): ${a.rawCaption}`
-          );
-        }
-
-        if (a.extractionMethod) {
-          parts.push(
-            `Attachment extraction method (${a.name || "image"}): ${a.extractionMethod}`
-          );
-        }
-
-        if (a.extractionStatus) {
-          parts.push(
-            `Attachment extraction status (${a.name || "image"}): ${a.extractionStatus}`
-          );
-        }
-
-        if (a.extractionError) {
-          parts.push(
-            `Attachment extraction error (${a.name || "image"}): ${a.extractionError}`
-          );
-        }
-
-        if (a.captionRisk) {
-          parts.push(
-            `Caption reliability (${a.name || "image"}): ${a.captionRisk}`
-          );
-        }
-
-        return parts.join("\n\n");
-      })
-      .filter(Boolean)
-      .join("\n\n");
-
-    const attachmentMetaBlock =
-      attachments.length > 0
-        ? `\n\nAttached file metadata:\n${attachments
-            .map((a) => {
-              const sizeKB = Math.round((a?.size || 0) / 1024);
-              return `- name: ${a?.name || "file"} | type: ${
-                a?.contentType || "unknown"
-              } | size: ${sizeKB}KB | url: ${a?.url || "(no url)"}`;
-            })
-            .join("\n")}`
-        : "";
-
-    const baseText = String(msg?.text || "").trim();
-
-    let promptBody = `${attachmentPolicy}\n\n${baseText}${attachmentTextBlock}${attachmentMetaBlock}`.trim();
-
-    if (!baseText && hasExtractedAttachmentText) {
-      promptBody =
-        `${attachmentPolicy}\n\n` +
-        `The user clicked Ask AI on an attachment-focused message.\n` +
-        `Explain what you understand from the extracted attachment text.\n` +
-        `If it is a document, summarize the key contents and notable fields.\n\n` +
-        `${attachmentTextBlock}${attachmentMetaBlock}`.trim();
+    if (!canChat) {
+      alert("You have view-only access in this hive and cannot use AI features.");
+      return;
     }
 
-    if (!baseText && hasDocumentWithoutText && !hasExtractedAttachmentText) {
-      promptBody =
-        `${attachmentPolicy}\n\n` +
-        `The user clicked Ask AI on a document-like attachment, but no text was extracted.\n` +
-        `Do not describe the image generically unless explicitly asked.\n` +
-        `Instead, explain that text extraction was unavailable and suggest re-uploading a clearer image or using a PDF/text source.\n\n` +
-        `${attachmentTextBlock}${attachmentMetaBlock}`.trim();
+    try {
+      setLoadingAI(true);
+
+      // 1) Collect attachments from THIS message only
+      const attachments = msg?.attachment
+        ? Array.isArray(msg.attachment)
+          ? msg.attachment
+          : [msg.attachment]
+        : [];
+
+      // 2) Build text/description blocks from attachments
+      const MAX_ATTACHMENT_CHARS_TO_AI = 8000;
+
+      const attachmentTextBlock = attachments
+        .filter((a) => a?.text || a?.imageDescription)
+        .map((a) => {
+          const hasText = !!a.text;
+          const hasDesc = !!a.imageDescription;
+          const parts = [];
+
+          if (hasText) {
+            const sliced = a.text.slice(0, MAX_ATTACHMENT_CHARS_TO_AI);
+            const truncated =
+              a.text.length > MAX_ATTACHMENT_CHARS_TO_AI ? "\n\n[TRUNCATED]" : "";
+            parts.push(
+              `Attached text content (${a.name || "file.txt"}):\n${sliced}${truncated}`
+            );
+          }
+
+          if (hasDesc) {
+            parts.push(
+              `Image description (${a.name || "image"}): ${a.imageDescription}`
+            );
+          }
+
+          return parts.join("\n\n");
+        })
+        .join("\n\n");
+
+      const attachmentMetaBlock =
+        attachments.length > 0
+          ? `\n\nAttached file metadata:\n${attachments
+              .map((a) => {
+                const sizeKB = Math.round((a?.size || 0) / 1024);
+                return `- name: ${a?.name || "file"} | type: ${
+                  a?.contentType || "unknown"
+                } | size: ${sizeKB}KB | url: ${a?.url || "(no url)"}`;
+              })
+              .join("\n")}`
+          : "";
+
+      // 3) Base text from the clicked message
+      const baseText = String(msg?.text || "").trim();
+
+      let promptBody = `${baseText}${attachmentTextBlock}${attachmentMetaBlock}`.trim();
+
+      // If no plain text but we *do* have files, give the AI some instructions
+      if (!promptBody && attachments.length > 0) {
+        promptBody =
+          `A user uploaded file(s) to a chat message, but plain text content was not extracted.\n` +
+          `${attachmentMetaBlock}\n\nReply with:\n` +
+          `1) A short acknowledgement\n2) What you can and cannot do without parsing the file contents\n` +
+          `3) Next best step\n4) Suggestions.`;
+      }
+
+      // If still nothing to say, bail
+      if (!promptBody) return;
+
+      const matchedDecisions = findRelevantDecisions(decisionRecords, promptBody);
+      const decisionContext = matchedDecisions.length
+        ? `Relevant past decisions:
+${matchedDecisions
+            .map(
+              (record) =>
+                `- id ${record.id} | ${record.title || "Decision"} | room ${
+                  record.honeycombID || record.source?.honeycombID || "unknown"
+                } | summary ${
+                  record.summary || record.decision || "No summary"
+                } | citation [${formatDecisionCitation(record)}]`
+            )
+            .join("\n")}
+
+Return ONLY raw JSON in this exact shape:
+{
+  "answer": "string",
+  "citationDecisionIds": ["decision-id"]
+}
+
+Rules:
+- citationDecisionIds must only use IDs from the relevant past decisions list above.
+- If you did not rely on a past decision, return an empty array.
+- Do not invent decisions or citations.`
+        : `Return ONLY raw JSON in this exact shape:
+{
+  "answer": "string",
+  "citationDecisionIds": []
+}
+
+Do not invent past decisions or citations.`;
+
+      const { prompt, history } = buildAskAIContext({
+        scope: effectiveScope,
+        messages,
+        targetMessage: msg,
+        promptBody: `${promptBody}\n\n${decisionContext}`,
+      });
+
+      const aiText = await callGeminiAPI(prompt, DEFAULT_AI_MODEL, history, {
+        hiveID,
+        honeycombID,
+        scope: effectiveScope,
+        feature: "chat_reply",
+      });
+
+      // 6) Save AI reply as a normal chat message
+      const messagesRef = collection(
+        db,
+        "Hive",
+        hiveID,
+        "Honeycomb",
+        honeycombID,
+        "messages"
+      );
+
+      await addDoc(messagesRef, {
+        type: "text",
+        text: buildChatReplyWithCitations(aiText, matchedDecisions),
+        attachment: null,
+        sender: "Hive AI",
+        senderId: "AI",
+        timestamp: serverTimestamp(),
+      });
+    } catch (err) {
+      console.error("AI request failed:", err);
+    } finally {
+      setLoadingAI(false);
     }
-
-    if (!promptBody && attachments.length > 0) {
-      promptBody =
-        `A user uploaded file(s) to a chat message, but plain text content was not extracted.\n` +
-        `${attachmentMetaBlock}\n\nReply with:\n` +
-        `1) A short acknowledgement\n` +
-        `2) What you can and cannot do without parsing the file contents\n` +
-        `3) Next best step\n` +
-        `4) Suggestions.`;
-    }
-
-    if (!promptBody) return;
-
-    const { prompt, history } = await buildAskAIContext({
-      scope,
-      messages,
-      targetMessage: msg,
-      promptBody,
-      decryptForAI: allowAIDecrypt,
-    });
-
-    console.log("ASK AI DEBUG", {
-      scope,
-      attachments,
-      prompt,
-      history,
-    });
-
-    const aiText = await callGeminiAPI(prompt, selectedModel, history);
-
-    const messagesRef = collection(
-      db,
-      "Hive",
-      hiveID,
-      "Honeycomb",
-      honeycombID,
-      "messages"
-    );
-
-    await addDoc(messagesRef, {
-      type: "text",
-      text: aiText,
-      attachment: null,
-      sender: "AI Bot",
-      senderId: "AI",
-      timestamp: serverTimestamp(),
-    });
-  } catch (err) {
-    console.error("AI request failed:", err);
-  } finally {
-    setLoadingAI(false);
-  }
-};
+  };
 
   /* ----------------- CREATE TASK FROM MESSAGE ----------------- */
-  const openCreateTask = (msg) => {
+  const closeTaskModal = () => {
+    setTaskModalOpen(false);
+    setTaskSourceMsg(null);
+    setTaskModalAttachmentText("");
+    setTaskModalPresentation(DEFAULT_TASK_MODAL_PRESENTATION);
+  };
+
+  const sendRoomMessageFromSandbox = useCallback(
+    async (text) => {
+      const cleanedText = String(text || "").trim();
+      if (!cleanedText || !canChat) {
+        return false;
+      }
+
+      try {
+        await sendUserMessage(cleanedText, hiveID, honeycombID, [], null, {
+          fileMentions: buildMessageFileReferences({ text: cleanedText }),
+        });
+
+        const unreadCount = await getHoneycombUnreadCount(hiveID, honeycombID, user.uid);
+        setUnreadMessageCount(unreadCount);
+        return true;
+      } catch (error) {
+        console.error("Sandbox split chat send failed:", error);
+        return false;
+      }
+    },
+    [canChat, hiveID, honeycombID, sendUserMessage, user?.uid]
+  );
+
+  const handleSandboxRoomUpdate = useCallback(
+    async ({ resultText }) => {
+      const cleanedText = String(resultText || "").trim();
+      if (!cleanedText || !canChat) {
+        return false;
+      }
+
+      try {
+        await sendUserMessage(cleanedText, hiveID, honeycombID, [], null, {
+          fileMentions: buildMessageFileReferences({ text: cleanedText }),
+        });
+
+        const unreadCount = await getHoneycombUnreadCount(hiveID, honeycombID, user.uid);
+        setUnreadMessageCount(unreadCount);
+        return true;
+      } catch (error) {
+        console.error("Sandbox room update failed:", error);
+        return false;
+      }
+    },
+    [canChat, hiveID, honeycombID, sendUserMessage, user?.uid]
+  );
+
+  const openCreateTask = (msg, options = {}) => {
     setTaskSourceMsg(msg);
+    setTaskModalAttachmentText(String(options.attachmentText || ""));
+    setTaskModalPresentation({
+      titleOverride:
+        String(options.titleOverride || "").trim() ||
+        DEFAULT_TASK_MODAL_PRESENTATION.titleOverride,
+      subtitleOverride:
+        String(options.subtitleOverride || "").trim() ||
+        DEFAULT_TASK_MODAL_PRESENTATION.subtitleOverride,
+      submitLabel:
+        String(options.submitLabel || "").trim() || DEFAULT_TASK_MODAL_PRESENTATION.submitLabel,
+    });
     setTaskModalOpen(true);
   };
 
@@ -786,7 +1513,10 @@ If the attachment looks document-like but no text was extracted, say clearly tha
     checklist,
     status,
     priority,
+    blockReason,
     dueAt,
+    assignees,
+    linkedDecisionId,
   }) => {
     const msg = taskSourceMsg;
     if (!msg) return;
@@ -794,10 +1524,39 @@ If the attachment looks document-like but no text was extracted, say clearly tha
     try {
       const arr = normalizeAttachments(msg);
       const firstTextAttachment = arr.find((x) => x?.text);
+      const linkedFiles = arr.map((file) => ({
+        name: file.name || "file",
+        url: file.url || "",
+        contentType: file.contentType || "unknown",
+        size: file.size || 0,
+      }));
+      const inferredDecision =
+        decisionRecords.find(
+          (record) =>
+            String(record.source?.parentMessageID || record.parentMessageID || "") ===
+              String(msg.id) &&
+            String(record.source?.honeycombID || record.honeycombID || "") ===
+              String(honeycombID)
+        ) || null;
+      const linkedDecision =
+        decisionRecords.find((record) => String(record.id) === String(linkedDecisionId || "")) ||
+        inferredDecision ||
+        null;
 
-      const combinedDescription = firstTextAttachment?.text
-        ? `${description}\n\n[Attachment: ${firstTextAttachment.name || "file.txt"}]\n${firstTextAttachment.text}`
-        : description;
+      let combinedDescription = String(description || "");
+
+      if (firstTextAttachment?.text && !combinedDescription.includes(firstTextAttachment.text)) {
+        combinedDescription = `${combinedDescription}\n\n[Attachment: ${
+          firstTextAttachment.name || "file.txt"
+        }]\n${firstTextAttachment.text}`.trim();
+      }
+
+      if (
+        taskModalAttachmentText &&
+        !combinedDescription.includes(taskModalAttachmentText.trim())
+      ) {
+        combinedDescription = `${combinedDescription}\n\n${taskModalAttachmentText.trim()}`.trim();
+      }
 
       await createTaskFromMessage({
         hiveID,
@@ -808,22 +1567,171 @@ If the attachment looks document-like but no text was extracted, say clearly tha
         checklist,
         status,
         priority,
-        assignees: [],
+        blockReason,
+        assignees: Array.isArray(assignees) ? assignees : [],
         dueAt,
         createdBy: user.uid,
+        linkedDecisionId: linkedDecision?.id || "",
+        linkedDecisionTitle: linkedDecision?.title || "",
+        linkedFiles,
+        sourceThreadID: linkedDecision?.threadID || "",
+        sourceDecisionID: linkedDecision?.id || "",
+        sourcePreview: {
+          parentMessageText: msg.text || "",
+          decisionTitle: linkedDecision?.title || "",
+          decisionSummary: linkedDecision?.summary || linkedDecision?.decision || "",
+        },
       });
 
-      setTaskModalOpen(false);
-      setTaskSourceMsg(null);
+      closeTaskModal();
     } catch (err) {
       console.error("Create task failed:", err);
       alert("Could not create task. Check console for details.");
     }
   };
 
+  const saveSandboxSettings = async (nextConfig) => {
+    if (!hiveID || !honeycombID || !user?.uid) return;
+
+    if (!["OWNER", "ADMIN"].includes(String(userRole || "").toUpperCase())) {
+      alert("Only owners and admins can change sandbox settings for this room.");
+      throw new Error("Insufficient permissions to change sandbox settings.");
+    }
+
+    try {
+      const roomRef = doc(db, "Hive", String(hiveID), "Honeycomb", String(honeycombID));
+      await updateDoc(roomRef, {
+        sandbox: normalizeSandboxConfig(nextConfig),
+        sandboxUpdatedAt: serverTimestamp(),
+        sandboxUpdatedBy: user.uid,
+      });
+    } catch (error) {
+      console.error("Failed to save sandbox settings:", error);
+      alert("Could not save sandbox settings right now.");
+      throw error;
+    }
+  };
+
+  const handleSandboxTaskRequest = ({ sourceMessage, attachmentText }) => {
+    if (!sourceMessage) return;
+    openCreateTask(sourceMessage, {
+      attachmentText,
+      titleOverride: "Create task from verified result",
+      subtitleOverride:
+        "Turn this verified sandbox result into tracked work with the repo context already attached.",
+      submitLabel: "Create task",
+    });
+  };
+
+  const openMessageInSandbox = (message, targetFilePath = "") => {
+    if (!message?.id) {
+      return;
+    }
+
+    const detectedFileReferences = buildMessageFileReferences(message);
+    setSandboxLaunchRequest({
+      sourceId: String(message.id),
+      targetFilePath: String(targetFilePath || detectedFileReferences[0] || "").trim(),
+    });
+    setActiveSubtab("sandbox");
+  };
+
+  const openDecisionLogger = (msg, options = {}) => {
+    if (!msg?.id || msg.senderId === "AI") return;
+    setDecisionSourceMsg(msg);
+    setDecisionModalMessageText(String(options.messageText || msg.text || ""));
+    setDecisionModalPresentation({
+      titleOverride:
+        String(options.titleOverride || "").trim() ||
+        DEFAULT_DECISION_MODAL_PRESENTATION.titleOverride,
+      subtitleOverride:
+        String(options.subtitleOverride || "").trim() ||
+        DEFAULT_DECISION_MODAL_PRESENTATION.subtitleOverride,
+      submitLabel:
+        String(options.submitLabel || "").trim() ||
+        DEFAULT_DECISION_MODAL_PRESENTATION.submitLabel,
+    });
+    setDecisionModalOpen(true);
+  };
+
+  const handleSandboxDecisionRequest = useCallback(
+    ({ sourceMessage, summaryText }) => {
+      if (!sourceMessage) return;
+
+      openDecisionLogger(sourceMessage, {
+        messageText: summaryText,
+        titleOverride: "Log decision from verified result",
+        subtitleOverride:
+          "Capture the fix approach, why it was chosen, and how the sandbox verified it.",
+        submitLabel: "Log decision",
+      });
+    },
+    []
+  );
+
+  const saveLoggedDecision = async ({
+    title,
+    summary,
+    rationale,
+    decision,
+    status,
+    supersedesDecisionId,
+  }) => {
+    const msg = decisionSourceMsg;
+    if (!msg?.id) return;
+
+    const existingDecision = decisionRecords.find(
+      (record) =>
+        String(record.source?.parentMessageID || record.parentMessageID || "") ===
+          String(msg.id) &&
+        String(record.source?.honeycombID || record.honeycombID || "") ===
+          String(honeycombID)
+    );
+
+    if (existingDecision) {
+      return;
+    }
+
+    try {
+      setLoggingDecisionId(msg.id);
+
+      await createDecisionRecord({
+        hiveID,
+        decisionID: `manual-${msg.id}`,
+        title: title || firstMeaningfulLine(msg.text, "Logged decision"),
+        summary: summary || truncateText(msg.text, 220),
+        rationale:
+          rationale || "Logged directly from a chat message for easier traceability.",
+        decision: decision || String(msg.text || "").trim() || "Decision logged from chat.",
+        status: status || DECISION_STATUSES.ACTIVE,
+        supersedesDecisionId: supersedesDecisionId || "",
+        honeycombID,
+        parentMessageID: msg.id,
+        threadID: `manual-${msg.id}`,
+        ownerUserId: msg.senderId || null,
+        ownerDisplayName: msg.sender || null,
+        createdByUserId: user?.uid || null,
+        createdByDisplayName: user?.displayName || user?.email || null,
+        generatedBy: "inline-log",
+        source: {
+          hiveID,
+          honeycombID,
+          parentMessageID: msg.id,
+          threadID: `manual-${msg.id}`,
+        },
+      });
+    } catch (error) {
+      console.error("Failed to log decision from message:", error);
+      alert("Could not log the decision right now.");
+    } finally {
+      setLoggingDecisionId("");
+    }
+  };
+
   /* ----------------- OPEN THREAD ----------------- */
   const handleOpenThread = useCallback(
     async (messageID) => {
+      setActiveSubtab("chat");
       setActiveThreadMessageID(messageID);
 
       try {
@@ -856,6 +1764,19 @@ If the attachment looks document-like but no text was extracted, say clearly tha
     },
     [hiveID, honeycombID, user]
   );
+
+  useEffect(() => {
+    requestedThreadHandledRef.current = false;
+  }, [requestedThreadMessageID]);
+
+  useEffect(() => {
+    if (!requestedThreadMessageID || requestedThreadHandledRef.current) return;
+    const exists = messages.some((msg) => msg.id === requestedThreadMessageID);
+    if (!exists) return;
+
+    requestedThreadHandledRef.current = true;
+    handleOpenThread(requestedThreadMessageID);
+  }, [requestedThreadMessageID, messages, handleOpenThread]);
 
   /* ----------------- RENDER MESSAGE TEXT ----------------- */
   const renderMessageText = (text, senderId = null) => {
@@ -901,9 +1822,9 @@ If the attachment looks document-like but no text was extracted, say clearly tha
         return (
           <div
             key={`text-${idx}`}
-            className="mb-3 rounded-2xl border border-white/8 bg-white/6 p-4 text-sm font-medium leading-relaxed text-slate-100"
+            className="mb-3 rounded-2xl border border-white/8 bg-white/6 p-4 text-sm leading-relaxed font-medium text-slate-100"
           >
-            <ul className="list-disc list-inside space-y-2 ml-1">
+            <ul className="ml-1 list-disc list-inside space-y-2">
               {items.map((it, i2) => (
                 <li key={i2} className="text-sm text-slate-100">
                   {it}
@@ -938,6 +1859,28 @@ If the attachment looks document-like but no text was extracted, say clearly tha
     );
   });
 
+  const incidentSignal =
+    [...messages]
+      .reverse()
+      .find((chatMessage) => matchesIncident(chatMessage.text)) || null;
+
+  const activeNowCount = new Set(
+    messages
+      .slice(-12)
+      .map((chatMessage) => chatMessage.senderId)
+      .filter((senderId) => senderId && senderId !== "AI")
+  ).size;
+
+  const sortedMembers = [...memberDirectory].sort((left, right) => {
+    const rank = { OWNER: 0, ADMIN: 1, MEMBER: 2, VIEWER: 3 };
+    const leftRank = rank[left.role] ?? 4;
+    const rightRank = rank[right.role] ?? 4;
+    if (leftRank !== rightRank) return leftRank - rightRank;
+    return String(left.displayName || left.email || left.uid).localeCompare(
+      String(right.displayName || right.email || right.uid)
+    );
+  });
+
   if (loading) return <p className="p-4 text-center">Loading user info...</p>;
 
   if (!user) {
@@ -948,31 +1891,81 @@ If the attachment looks document-like but no text was extracted, say clearly tha
   const modalAttachmentText = (() => {
     const a = taskSourceMsg?.attachment;
     const arr = a ? (Array.isArray(a) ? a : [a]) : [];
-    return arr.find((x) => x?.text)?.text || "";
+    const textAttachment = arr.find((x) => x?.text)?.text || "";
+    return [textAttachment, taskModalAttachmentText].filter(Boolean).join("\n\n");
   })();
+  const taskSourceDecision =
+    decisionRecords.find(
+      (record) =>
+        String(record.source?.parentMessageID || record.parentMessageID || "") ===
+          String(taskSourceMsg?.id || "") &&
+        String(record.source?.honeycombID || record.honeycombID || "") ===
+          String(honeycombID)
+    ) || null;
 
-  
+  // ✅ HERE is sendDisabled (right before return)
   const sendDisabled =
-    !canChat ||
-    uploadState.busy ||
-    (!message.trim() && pendingAttachments.length === 0);
+    !canChat || (!message.trim() && pendingAttachments.length === 0);
   const participantCount = Object.keys(userRoles).length;
+  const hiveLabel = String(hiveMeta?.name || hiveID);
+  const roomLabel = String(roomMeta?.displayName || roomMeta?.name || honeycombID);
   const permissionLabel = toTitleCase(userRole || "viewer");
-  const activeNowCount = new Set(
-    messages
-      .slice(-12)
-      .map((chatMessage) => chatMessage.senderId)
-      .filter((senderId) => senderId && senderId !== "AI")
-  ).size;
+  const roomDecisionRecords = decisionRecords.filter((record) => {
+    return (
+      String(record.honeycombID || record.source?.honeycombID || "") ===
+      String(honeycombID)
+    );
+  });
+  const roomTaskRecords = taskRecords.filter((task) => {
+    return String(task.source?.honeycombID || "") === String(honeycombID);
+  });
+  const roomDecisionCount = roomDecisionRecords.length;
+  const openRoomTaskCount = roomTaskRecords.filter((task) => {
+    const status = String(task.status || "todo").toLowerCase();
+    return !CLOSED_TASK_STATUSES.has(status);
+  }).length;
+  const roomFiles = messages.flatMap((chatMessage) =>
+    normalizeAttachments(chatMessage).map((file, index) => ({
+      id: `${chatMessage.id}-${index}`,
+      file,
+      messageId: chatMessage.id,
+      sender: chatMessage.sender || "User",
+      timestamp: chatMessage.timestamp,
+      text: chatMessage.text || "",
+    }))
+  );
+  const sandboxMessages = [...messages]
+    .filter(
+      (entry) =>
+        entry?.senderId !== "AI" &&
+        (
+          hasCodeBlock(entry.text) ||
+          looksLikeStackTrace(entry.text) ||
+          looksLikeDiff(entry.text) ||
+          extractFileReferences(entry.text).length > 0
+        )
+    )
+    .reverse();
+  const sandboxWorkspaceActive = activeSubtab === "sandbox";
 
   return (
     <div className="page-shell">
       <div className="page-frame">
-      <div className={`flex min-h-[calc(100vh-2rem)] flex-col gap-4 ${activeThreadMessageID ? "xl:pr-[26rem]" : ""}`}>
-        {/* Header with Search */}
-        <header className="workspace-shell">
-          <div className="workspace-topbar">
-            <h1 className="workspace-brand-title text-[clamp(1.8rem,3vw,3rem)]">
+        <div
+          className={`flex min-h-[calc(100vh-2rem)] flex-col gap-4 ${
+            activeThreadMessageID ? "xl:pr-[26rem]" : ""
+          }`}
+        >
+          {!sandboxWorkspaceActive ? (
+          <header className="hero-panel relative z-10">
+          <div className="chat-header mb-6">
+            <div className="space-y-4">
+              <span className="hero-chip">Honeycomb conversation</span>
+              <p className="text-kicker">Active room</p>
+            <h1 className="relative max-w-5xl break-words text-[clamp(2.1rem,4.5vw,4.25rem)] font-semibold leading-[1.02] tracking-[-0.05em] text-transparent">
+              <span className="pointer-events-none absolute inset-0 text-white">
+                {roomLabel} / {hiveLabel}
+              </span>
               🐝 {hiveID} / {honeycombID}
               {unreadMessageCount > 0 && (
                 <span
@@ -981,10 +1974,16 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                     unreadMessageCount > 1 ? "s" : ""
                   }`}
                 >
-                  {unreadMessageCount}
+                  {unreadMessageCount} unread
                 </span>
               )}
-            </h1>
+              </h1>
+              <div className="action-row">
+                <span className="status-pill">#{roomLabel}</span>
+                <span className="status-pill">{permissionLabel}</span>
+                <span className="status-pill">{canChat ? "Can contribute" : "View only"}</span>
+              </div>
+            </div>
 
             <button
               onClick={() => router.push(`/hive/${hiveID}`)}
@@ -995,7 +1994,7 @@ If the attachment looks document-like but no text was extracted, say clearly tha
             </button>
           </div>
 
-          <div className="glass-panel relative">
+          <div className="relative">
             <input
               type="text"
               value={searchQuery}
@@ -1004,7 +2003,7 @@ If the attachment looks document-like but no text was extracted, say clearly tha
               className="input-shell pl-10 pr-10"
             />
             <svg
-              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400"
+              className="pointer-events-none absolute left-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
@@ -1036,8 +2035,49 @@ If the attachment looks document-like but no text was extracted, say clearly tha
               {filteredMessages.length !== 1 ? "s" : ""}
             </p>
           )}
-        </header>
 
+          {incidentSignal && (
+            <div className="mt-4 rounded-[1.2rem] border border-rose-300/25 bg-rose-300/12 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs uppercase tracking-[0.16em] text-rose-100/75">
+                    Active incident detected
+                  </div>
+                  <p className="mt-2 text-sm leading-7 text-rose-50">
+                    {truncateText(incidentSignal.text, 100)}
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  className="button-danger"
+                  onClick={() => handleOpenThread(incidentSignal.id)}
+                >
+                  Open war room
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="tab-row mt-5">
+            {ROOM_TABS.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                className={`tab-button ${activeSubtab === tab.id ? "active" : ""}`}
+                onClick={() => setActiveSubtab(tab.id)}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </header>
+          ) : null}
+
+        <div className={`honeycomb-room-grid ${sandboxWorkspaceActive ? "honeycomb-room-grid--sandbox-focus" : ""}`}>
+          <div className="space-y-4">
+        {activeSubtab === "chat" ? (
+          <>
         {/* Main feed */}
         <main className="chat-feed flex-1 space-y-6">
           {hasMoreMessages && messages.length > 0 && !searchQuery && (
@@ -1079,12 +2119,25 @@ If the attachment looks document-like but no text was extracted, say clearly tha
             const attachments = normalizeAttachments(m);
             const threadUnread = unreadThreads[m.id] || 0;
             const threadStatus = threads[m.id]?.[0]?.status || "open";
+            const loggedDecision =
+              decisionRecords.find(
+                (record) =>
+                  String(record.source?.parentMessageID || record.parentMessageID || "") ===
+                    String(m.id) &&
+                  String(record.source?.honeycombID || record.honeycombID || "") ===
+                    String(honeycombID)
+              ) || null;
+            const detectedFileReferences = buildMessageFileReferences(m);
+            const codeAwareMessage =
+              hasCodeBlock(m.text) || looksLikeStackTrace(m.text) || looksLikeDiff(m.text);
+            const sandboxReadyMessage =
+              codeAwareMessage || detectedFileReferences.length > 0;
 
             return (
               <div
                 id={`message-${m.id}`}
                 key={m.id}
-                className={`relative max-w-[52rem] rounded-[1.5rem] border p-4 shadow-lg shadow-slate-950/20 transition-transform duration-200 hover:-translate-y-0.5 ${
+                className={`relative max-w-[46rem] rounded-[1.5rem] border p-4 shadow-lg shadow-slate-950/20 transition-transform duration-200 hover:-translate-y-0.5 ${
                   m.senderId === "AI"
                     ? "w-full border-cyan-300/20 bg-gradient-to-br from-cyan-300/12 to-slate-900/70"
                     : `${getUserColor(m.senderId)} w-full ${
@@ -1106,6 +2159,14 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                     {m.senderId === "AI" ? "🤖 " : ""}
                     {m.sender}
                   </p>
+                  {m.senderId === "AI" ? (
+                    <>
+                      <span className="status-pill bg-violet-300/15 text-violet-100">AI</span>
+                      <span className="status-pill bg-emerald-300/12 text-emerald-100">
+                        memory-enabled
+                      </span>
+                    </>
+                  ) : null}
                   {m.senderId !== "AI" && userRoles[m.senderId] && (
                     <span className="text-xs text-slate-300" title={userRoles[m.senderId]}>
                       {getRoleEmoji(userRoles[m.senderId])}
@@ -1132,38 +2193,10 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                 )}
 
                 <div className="mt-4 flex flex-wrap gap-2">
-                    {m.senderId === user.uid && (
+                    {m.senderId !== "AI" && (
                     <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/30 p-3">
-                      {/* Model picker */}
-                      <select
-                        value={selectedModel}
-                        onChange={(e) => setSelectedModel(e.target.value)}
-                        className="input-shell min-w-[12rem] py-2 text-sm"
-                        title="Model"
-                        aria-label="Choose AI model"
-                      >
-                        <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                        <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
-                        <option value="gemini-2.5-pro">gemini-2.5-pro</option>
-                      </select>
+                      
 
-                      {/* NEW: scope picker */}
-                      <select
-                        value={aiScope}
-                        onChange={(e) => setAiScope(e.target.value)}
-                        className="input-shell min-w-[12rem] py-2 text-sm"
-                        title="How much chat context to send to AI"
-                        aria-label="Ask AI context scope"
-                      >
-                        <option value="message">This message only</option>
-                        <option value="last_2">Last 2 messages</option>
-                        <option value="last_3">Last 3 messages</option>
-                        <option value="last_5">Last 5 messages</option>
-                        <option value="last_20">Last 20 messages</option>
-                        <option value="entire_chat">Entire chat</option>
-                      </select>
-
-                      {/* Ask AI uses the selected scope */}
                       <button
                         className="button-secondary"
                         onClick={() => handleAIReply(m, aiScope)}
@@ -1171,21 +2204,7 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                         aria-disabled={loadingAI || !canChat}
                         type="button"
                       >
-                        {loadingAI ? "Thinking..." : "Ask AI 🤖"}
-                      </button>
-
-                      <button
-                        className={`rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.14em] transition ${
-                          allowAIDecrypt
-                            ? "border-amber-300/30 bg-amber-300/18 text-amber-100"
-                            : "border-white/12 bg-white/6 text-slate-200 hover:bg-white/10"
-                        }`}
-                        onClick={() => setAllowAIDecrypt((prev) => !prev)}
-                        disabled={!canChat}
-                        type="button"
-                        title="Allow AI to reverse protected values for this request"
-                      >
-                        {allowAIDecrypt ? "Decrypt for AI: On" : "Decrypt for AI"}
+                        {loadingAI ? "Thinking..." : "Ask AI"}
                       </button>
 
                       <button
@@ -1210,13 +2229,41 @@ If the attachment looks document-like but no text was extracted, say clearly tha
                     onClick={() => handleOpenThread(m.id)}
                     type="button"
                   >
-                    {threadStatus === "closed"
-                      ? "Closed Thread"
-                      : threads[m.id]?.length > 0
-                      ? "View Thread"
-                      : "Start Thread"}
+                    Reply
                   </button>
+
+                  {m.senderId !== "AI" && (
+                    <button
+                      className="button-ghost text-xs sm:text-sm"
+                      onClick={() => openDecisionLogger(m)}
+                      disabled={!canChat || loggingDecisionId === m.id || Boolean(loggedDecision)}
+                      type="button"
+                    >
+                      {loggedDecision
+                        ? "Decision logged"
+                        : loggingDecisionId === m.id
+                        ? "Logging..."
+                        : "Log decision"}
+                    </button>
+                  )}
                 </div>
+
+                {m.senderId !== "AI" && sandboxReadyMessage ? (
+                  <div className="mt-3 flex flex-wrap items-center gap-2 rounded-2xl border border-violet-300/18 bg-violet-300/10 p-3">
+                    <span className="text-xs font-semibold uppercase tracking-[0.16em] text-violet-100">
+                      Sandbox
+                    </span>
+                    <button
+                      className="button-primary text-xs sm:text-sm"
+                      onClick={() => openMessageInSandbox(m, detectedFileReferences[0] || "")}
+                      type="button"
+                    >
+                      {detectedFileReferences[0]
+                        ? `Open ${detectedFileReferences[0]}`
+                        : "Open file in sandbox"}
+                    </button>
+                  </div>
+                ) : null}
               </div>
             );
           })}
@@ -1232,7 +2279,7 @@ If the attachment looks document-like but no text was extracted, say clearly tha
           {/* ✅ Pending attachment queue UI */}
           {pendingAttachments.length > 0 && (
             <div className="w-full rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-3">
-              <div className="flex items-center justify-between mb-2">
+              <div className="mb-2 flex items-center justify-between">
                 <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-100">
                   📎 Ready to send ({pendingAttachments.length})
                 </p>
@@ -1279,20 +2326,95 @@ If the attachment looks document-like but no text was extracted, say clearly tha
           )}
 
           <div className="flex flex-col gap-3 lg:flex-row">
-            <div className="flex-1 relative">
+            <div className="relative flex-1">
+              {composerMentionedFiles.length > 0 ? (
+                <div className="mb-2 flex flex-wrap gap-2">
+                  {composerMentionedFiles.map((filePath) => (
+                    <button
+                      key={`composer-file-${filePath}`}
+                      type="button"
+                      className="chat-file-chip"
+                      onClick={() => {
+                        setActiveSubtab("sandbox");
+                        setSandboxLaunchRequest({
+                          sourceId: "",
+                          targetFilePath: filePath,
+                        });
+                      }}
+                    >
+                      <span className="chat-file-chip-icon">#</span>
+                      <span>{filePath}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+
               <input
+                ref={messageInputRef}
                 className="input-shell pr-12"
-                placeholder={canChat ? "Type or use voice..." : "View-only access"}
+                placeholder={
+                  canChat
+                    ? sandboxConfig.linkedProjectPath
+                      ? "Type a message, then use @filename (for example @LoginPanel)..."
+                      : "Type or use voice..."
+                    : "View-only access"
+                }
                 value={message}
-                onChange={(e) => setMessage(e.target.value)}
+                onChange={handleMessageInputChange}
+                onKeyDown={handleMessageInputKeyDown}
+                onClick={(e) =>
+                  updateComposerFilePicker(
+                    e.currentTarget.value,
+                    e.currentTarget.selectionStart ?? e.currentTarget.value.length
+                  )
+                }
+                onKeyUp={(e) =>
+                  updateComposerFilePicker(
+                    e.currentTarget.value,
+                    e.currentTarget.selectionStart ?? e.currentTarget.value.length
+                  )
+                }
+                onBlur={() => {
+                  window.setTimeout(() => {
+                    closeComposerFilePicker();
+                  }, 120);
+                }}
                 disabled={!canChat}
+                autoComplete="off"
               />
+
+              {composerFilePicker.open && composerFileSuggestions.length > 0 ? (
+                <div className="chat-file-suggestions" role="listbox" aria-label="Repo files">
+                  <div className="chat-file-suggestions-header">
+                    <span>Repo files</span>
+                    <span>{sandboxConfig.repoLabel || roomLabel}</span>
+                  </div>
+                  {composerFileSuggestions.map((filePath, index) => (
+                    <button
+                      key={`composer-suggestion-${filePath}`}
+                      type="button"
+                      className={`chat-file-suggestion ${
+                        index === composerFilePicker.selectedIndex ? "active" : ""
+                      }`}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        applyComposerFileSuggestion(filePath);
+                      }}
+                    >
+                      <span className="chat-file-suggestion-name">
+                        {getFileBasename(filePath)}
+                      </span>
+                      <span className="chat-file-suggestion-path">{filePath}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
 
               {speechSupported && canChat && (
                 <button
                   type="button"
                   onClick={toggleVoiceRecording}
-                  className={`absolute right-2 top-1/2 -translate-y-1/2 p-2 rounded-lg transition-all duration-200 ${
+                  className={`absolute right-3 top-1/2 -translate-y-1/2 rounded-full p-2 transition ${
                     isRecording
                       ? "bg-rose-500 text-white shadow-lg shadow-rose-500/20"
                       : "bg-cyan-300/12 text-cyan-100 hover:bg-cyan-300/20"
@@ -1310,45 +2432,344 @@ If the attachment looks document-like but no text was extracted, say clearly tha
               )}
             </div>
 
-            {canChat && (
-            <FileUploader
-              hiveID={hiveID}
-              honeycombID={honeycombID}
-              userId={user.uid}
-              onUploaded={handleFileUploaded}
-              onUploadStateChange={setUploadState}
-            />
-          )}
-
-            <button
-              type="submit"
-              disabled={sendDisabled}
-              className="button-primary min-w-[8rem]"
-              title={uploadState.busy ? "Wait for file processing to finish" : "Send"}
-            >
-              <span className="hidden sm:inline">
-                {uploadState.phase === "processing"
-                  ? "Processing..."
-                  : uploadState.phase === "uploading"
-                  ? `Uploading ${uploadState.progress}%`
-                  : "Send"}
-              </span>
-              <svg
-                className="w-5 h-5 sm:hidden"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
+            <div className="flex flex-wrap gap-3">
+              {canChat && (
+                <FileUploader
+                  hiveID={hiveID}
+                  honeycombID={honeycombID}
+                  userId={user.uid}
+                  onUploaded={handleFileUploaded}
                 />
-              </svg>
-            </button>
+              )}
+
+              <button
+                type="button"
+                disabled={sendDisabled || loadingAI}
+                className="button-secondary"
+                onClick={() =>
+                  handleAIReply({ text: message, attachment: pendingAttachments }, aiScope)
+                }
+              >
+                {loadingAI ? "Thinking..." : "Ask AI"}
+              </button>
+
+              <button
+                type="submit"
+                disabled={sendDisabled}
+                className="button-primary min-w-[8rem]"
+              >
+                Send
+              </button>
+            </div>
           </div>
+
+          {sandboxConfig.linkedProjectPath ? (
+            <div className="chat-file-helper-row">
+              <span className="chat-file-helper">
+                Type <b>@</b> plus a file name to link repo files directly from chat.
+              </span>
+              {composerFilesLoading ? (
+                <span className="chat-file-helper">Loading repo files...</span>
+              ) : composerFilesError ? (
+                <span className="chat-file-helper text-rose-200">{composerFilesError}</span>
+              ) : linkedRepoFiles.length > 0 ? (
+                linkedRepoFiles.length === 1 ? (
+                  <span className="chat-file-helper">
+                    Only 1 file available. Check Sandbox settings → Allowed project paths
+                    {sandboxConfig.allowedPaths.length
+                      ? ` (${sandboxConfig.allowedPaths.join(", ")})`
+                      : ""}.
+                  </span>
+                ) : (
+                  <span className="chat-file-helper">
+                    {linkedRepoFiles.length} file{linkedRepoFiles.length === 1 ? "" : "s"} available
+                  </span>
+                )
+              ) : null}
+            </div>
+          ) : null}
+
+          <p className="text-xs uppercase tracking-[0.16em] text-slate-300/55">
+            AI replies use recent room context and include a citation when they pull from past decisions.
+          </p>
         </form>
+          </>
+        ) : activeSubtab === "decisions" ? (
+          <section className="glass-panel space-y-4">
+            <div className="chat-header">
+              <div>
+                <p className="text-kicker">Room decisions</p>
+                <h2 className="panel-title text-2xl">Decisions from {roomLabel}</h2>
+              </div>
+              <span className="status-pill">
+                {roomDecisionCount === 1 ? "1 decision" : `${roomDecisionCount} decisions`}
+              </span>
+            </div>
+
+            {roomDecisionRecords.length ? (
+              <div className="space-y-3">
+                {roomDecisionRecords.map((decision) => (
+                  <article key={decision.id} className="surface-card">
+                    <div className="surface-card-inner space-y-3">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="panel-title">
+                            {decision.title || "Decision Record"}
+                          </div>
+                          <div className="panel-subtitle">
+                            {decision.ownerDisplayName || decision.createdByDisplayName || "Team"} |{" "}
+                            {formatStamp(decision.updatedAt || decision.createdAt || decision.closedAt)}
+                          </div>
+                        </div>
+                        <span className="status-pill">
+                          {(Array.isArray(decision.tags) && decision.tags[0]) ||
+                            decision.status ||
+                            "Decision"}
+                        </span>
+                      </div>
+                      <p className="text-sm leading-7 text-slate-100">
+                        {decision.summary || decision.decision || "No summary stored yet."}
+                      </p>
+                      {decision.parentMessageID || decision.source?.parentMessageID ? (
+                        <button
+                          type="button"
+                          className="workspace-inline-link"
+                          onClick={() => {
+                            setActiveSubtab("chat");
+                            handleOpenThread(
+                              decision.source?.parentMessageID || decision.parentMessageID
+                            );
+                          }}
+                        >
+                          Open source chat
+                        </button>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">
+                No decision records have been logged from this room yet.
+              </div>
+            )}
+          </section>
+        ) : activeSubtab === "tasks" ? (
+          <section className="glass-panel space-y-4">
+            <div className="chat-header">
+              <div>
+                <p className="text-kicker">Room tasks</p>
+                <h2 className="panel-title text-2xl">Tasks created from {roomLabel}</h2>
+              </div>
+              <span className="status-pill">
+                {roomTaskRecords.length === 1 ? "1 task" : `${roomTaskRecords.length} tasks`}
+              </span>
+            </div>
+
+            {roomTaskRecords.length ? (
+              <div className="space-y-3">
+                {roomTaskRecords.map((task) => (
+                  <article key={task.id} className="surface-card">
+                    <div className="surface-card-inner space-y-3">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="panel-title">{task.title || "Untitled task"}</div>
+                          <div className="panel-subtitle">
+                            {task.priority || "medium"} priority | {task.status || "todo"}
+                          </div>
+                        </div>
+                        <span className="status-pill">
+                          {task.linkedDecisionTitle || "Room task"}
+                        </span>
+                      </div>
+                      <p className="text-sm leading-7 text-slate-100">
+                        {task.description || "No description yet."}
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          className="workspace-inline-link"
+                          onClick={() => {
+                            setActiveSubtab("chat");
+                            handleOpenThread(task.source?.messageID);
+                          }}
+                          disabled={!task.source?.messageID}
+                        >
+                          Open source chat
+                        </button>
+                        {task.blockReason ? (
+                          <span className="status-pill bg-rose-300/12 text-rose-100">
+                            Blocked: {task.blockReason}
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">
+                No tasks have been created from this room yet.
+              </div>
+            )}
+          </section>
+        ) : activeSubtab === "sandbox" ? (
+          <DeveloperSandboxWorkspace
+            hiveID={hiveID}
+            honeycombID={honeycombID}
+            sandboxConfig={sandboxConfig}
+            codeAwareMessages={sandboxMessages}
+            roomMessages={messages}
+            currentUserId={user?.uid || ""}
+            currentUserName={user?.displayName || user?.email || ""}
+            currentUserEmail={user?.email || ""}
+            currentUserPhotoURL={user?.photoURL || ""}
+            roomMembers={sortedMembers}
+            canChat={canChat}
+            unreadMessageCount={unreadMessageCount}
+            roomTasks={roomTaskRecords}
+            roomDecisions={roomDecisionRecords}
+            requestedSourceId={sandboxLaunchRequest.sourceId}
+            requestedTargetFilePath={sandboxLaunchRequest.targetFilePath}
+            onRequestedSandboxHandled={() =>
+              setSandboxLaunchRequest({
+                sourceId: "",
+                targetFilePath: "",
+              })
+            }
+            onJumpToChat={jumpToLatestRoomChat}
+            onOpenThread={handleOpenThread}
+            onSendRoomMessage={sendRoomMessageFromSandbox}
+            onPostRoomUpdate={handleSandboxRoomUpdate}
+            onSaveSettings={saveSandboxSettings}
+            onCreateTask={handleSandboxTaskRequest}
+            onLogDecisionRequest={handleSandboxDecisionRequest}
+            onOpenTasksTab={() => setActiveSubtab("tasks")}
+            onOpenDecisionsTab={() => setActiveSubtab("decisions")}
+            onLayoutModeChange={setSandboxLayoutMode}
+            canManageSettings={["OWNER", "ADMIN"].includes(String(userRole || "").toUpperCase())}
+          />
+        ) : (
+          <section className="glass-panel space-y-4">
+            <div className="chat-header">
+              <div>
+                <p className="text-kicker">Room files</p>
+                <h2 className="panel-title text-2xl">Attachments shared in {roomLabel}</h2>
+              </div>
+              <span className="status-pill">
+                {roomFiles.length === 1 ? "1 file" : `${roomFiles.length} files`}
+              </span>
+            </div>
+
+            {roomFiles.length ? (
+              <div className="space-y-3">
+                {roomFiles.map((entry) => (
+                  <article key={entry.id} className="surface-card">
+                    <div className="surface-card-inner space-y-3">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="panel-title">{entry.file.name || "Attachment"}</div>
+                          <div className="panel-subtitle">
+                            Shared by {entry.sender} | {formatStamp(entry.timestamp)}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          className="workspace-inline-link"
+                          onClick={() => {
+                            setActiveSubtab("chat");
+                            handleOpenThread(entry.messageId);
+                          }}
+                        >
+                          View message
+                        </button>
+                      </div>
+                      <AttachmentList attachments={[entry.file]} />
+                      {entry.text ? (
+                        <p className="text-sm leading-7 text-slate-300">
+                          {truncateText(entry.text, 180)}
+                        </p>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">
+                No files have been shared in this room yet.
+              </div>
+            )}
+          </section>
+        )}
+          </div>
+
+          {!sandboxWorkspaceActive ? (
+          <aside className="glass-panel honeycomb-room-sidebar">
+            <div>
+              <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
+                Room stats
+              </div>
+
+              <div className="mt-4 grid gap-3">
+                <div className="metric-card">
+                  <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
+                    Active now
+                  </div>
+                  <div className="mt-3 text-2xl font-semibold text-white">{activeNowCount}</div>
+                </div>
+
+                <div className="metric-card">
+                  <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
+                    Open tasks
+                  </div>
+                  <div className="mt-3 text-2xl font-semibold text-white">{openRoomTaskCount}</div>
+                </div>
+
+                <div className="metric-card">
+                  <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
+                    Decisions
+                  </div>
+                  <div className="mt-3 text-2xl font-semibold text-white">{roomDecisionCount}</div>
+                </div>
+
+                <div className="metric-card">
+                  <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
+                    Members
+                  </div>
+                  <div className="mt-3 text-2xl font-semibold text-white">{participantCount}</div>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-6">
+              <div className="text-xs uppercase tracking-[0.16em] text-slate-300/60">
+                Members
+              </div>
+
+              <div className="mt-4 space-y-3">
+                {sortedMembers.map((member) => (
+                  <div
+                    key={member.uid}
+                    className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-3"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate font-medium text-white">
+                        {member.displayName || member.email || member.uid}
+                      </div>
+                      {member.email ? (
+                        <div className="truncate text-xs text-slate-300/70">{member.email}</div>
+                      ) : null}
+                    </div>
+
+                    <span className="status-pill">{member.role || "MEMBER"}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </aside>
+          ) : null}
+        </div>
+        </div>
       </div>
 
       {/* Thread Panel */}
@@ -1379,12 +2800,37 @@ If the attachment looks document-like but no text was extracted, say clearly tha
       {/* Create Task Modal */}
       <CreateTaskModal
         open={taskModalOpen}
-        onClose={() => setTaskModalOpen(false)}
+        onClose={closeTaskModal}
         onSave={saveTask}
         messageText={taskSourceMsg?.text || ""}
         attachmentText={modalAttachmentText}
+        members={sortedMembers}
+        decisionOptions={decisionRecords}
+        initialDecisionId={taskSourceDecision?.id || ""}
+        titleOverride={taskModalPresentation.titleOverride}
+        subtitleOverride={taskModalPresentation.subtitleOverride}
+        submitLabel={taskModalPresentation.submitLabel}
       />
-    </div>
+
+      <LogDecisionModal
+        open={decisionModalOpen}
+        onClose={() => {
+          setDecisionModalOpen(false);
+          setDecisionSourceMsg(null);
+          setDecisionModalMessageText("");
+          setDecisionModalPresentation(DEFAULT_DECISION_MODAL_PRESENTATION);
+        }}
+        onSave={saveLoggedDecision}
+        messageText={decisionModalMessageText || decisionSourceMsg?.text || ""}
+        titleOverride={decisionModalPresentation.titleOverride}
+        subtitleOverride={decisionModalPresentation.subtitleOverride}
+        submitLabel={decisionModalPresentation.submitLabel}
+        decisionOptions={decisionRecords.filter(
+          (record) =>
+            String(record.id || "") !== `manual-${decisionSourceMsg?.id || ""}` &&
+            String(record.status || "").toLowerCase() !== DECISION_STATUSES.ARCHIVED
+        )}
+      />
     </div>
   );
 }
@@ -1574,7 +3020,7 @@ function ThreadPanel({
         `;
 
         // L4 Repository call to AI Gateway
-        await NectarRepository.distillAndSave(hiveID, fullDiscussionContext);
+        // Automatic nectar distillation disabled to avoid background AI usage.
         
         console.log("🍯 Knowledge Nectar successfully stored in Hive Memory!");
       } catch (err) {
@@ -1718,7 +3164,7 @@ function ThreadPanel({
           return threadSummary ? (
             <div className="mt-4 overflow-hidden rounded-2xl border border-white/10 bg-white/5 shadow-lg">
               <div className="flex items-center gap-2 border-b border-white/10 bg-cyan-300/10 px-4 py-3">
-                <span className="text-2xl">✨</span>
+                <span className="text-2xl text-cyan-100">*</span>
                 <h2 className="text-base font-bold text-white">Thread Summary</h2>
               </div>
 
@@ -1773,15 +3219,82 @@ function ThreadPanel({
 }
 
 /* ----------------- SUMMARY CARD ----------------- */
+function parseThreadSummaryContent(summary) {
+  const rawText = String(summary?.summaryText || "").trim();
+  let title = String(summary?.summaryTitle || "").trim();
+  let body = String(summary?.summaryBody || "").trim();
+
+  if (!title || !body) {
+    const titleMatch = rawText.match(/(?:^|\n)\s*Title:\s*(.+?)\s*(?:\n|$)/i);
+    const bodyMatch = rawText.match(/(?:^|\n)\s*Summary:\s*([\s\S]*)$/i);
+
+    if (!title) {
+      title = String(titleMatch?.[1] || "").trim();
+    }
+
+    if (!body) {
+      body = String(bodyMatch?.[1] || rawText).trim();
+    }
+  }
+
+  if (!title) {
+    title = firstMeaningfulLine(rawText, "Thread summary");
+  }
+
+  if (!body) {
+    body = "No summary text available.";
+  }
+
+  const preview = truncateText(body, 180);
+  const copyText = `Title: ${title}\nSummary:\n${body}`;
+
+  return { title, body, preview, copyText };
+}
+
+function looksLikeRawMessageDump(body) {
+  const text = String(body || "").toLowerCase();
+  if (!text) return false;
+
+  return (
+    text.includes("thread summary:") ||
+    text.includes("messages from") ||
+    text.includes("participants") ||
+    text.includes("recent discussion:") ||
+    text.includes("the thread centered on:") ||
+    text.split(":").length >= 4
+  );
+}
+
+function buildReadableThreadSummary(parentMessage, threadMessages = [], fallbackTitle = "Thread summary") {
+  const parsed = buildThreadSummaryFromConversation(
+    parentMessage?.text || fallbackTitle,
+    threadMessages
+  );
+
+  return {
+    title: parsed.title || fallbackTitle,
+    body: parsed.body || "No summary text available.",
+    preview: truncateText(parsed.body || "", 180),
+    copyText:
+      parsed.text ||
+      `Title: ${parsed.title || fallbackTitle}\nSummary:\n${parsed.body || "No summary text available."}`,
+  };
+}
+
 function SummaryCard({
         summary,
         index,
         onOpenThread,
         threadMessages,
+        parentMessage,
         showOpenButton = true,
       }) {
         const [expanded, setExpanded] = useState(false);
         const [copied, setCopied] = useState(false);
+        const parsedSummaryRaw = parseThreadSummaryContent(summary);
+        const parsedSummary = looksLikeRawMessageDump(parsedSummaryRaw.body)
+          ? buildReadableThreadSummary(parentMessage, threadMessages, parsedSummaryRaw.title)
+          : parsedSummaryRaw;
 
         const [userColor] = useState(() => {
           const colors = [
@@ -1829,7 +3342,7 @@ function SummaryCard({
         const handleCopy = async (e) => {
           e.stopPropagation();
           try {
-            await navigator.clipboard.writeText(summary.summaryText || "");
+            await navigator.clipboard.writeText(parsedSummary.copyText || "");
             setCopied(true);
             setTimeout(() => setCopied(false), 2000);
           } catch (err) {
@@ -1883,12 +3396,16 @@ function SummaryCard({
                       )}
                     </div>
 
+                    <div className="mb-1 text-sm font-semibold leading-relaxed text-white">
+                      {parsedSummary.title}
+                    </div>
+
                     <p
                       className={`text-sm leading-relaxed text-slate-100 ${
                         !expanded ? "line-clamp-2" : ""
                       }`}
                     >
-                      {summary.summaryText}
+                      {parsedSummary.preview}
                     </p>
                   </div>
                 </div>
@@ -1908,8 +3425,11 @@ function SummaryCard({
             {expanded && (
               <div className="px-3 pb-3 pt-0">
                 <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-3">
+                  <div className="mb-2 text-sm font-semibold text-white">
+                    {parsedSummary.title}
+                  </div>
                   <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-100">
-                    {summary.summaryText}
+                    {parsedSummary.body}
                   </p>
                 </div>
 

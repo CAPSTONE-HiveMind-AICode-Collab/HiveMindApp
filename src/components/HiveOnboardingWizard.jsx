@@ -1,7 +1,6 @@
 "use client";
 
 import { useDeferredValue, useEffect, useMemo, useState } from "react";
-import { callClaudeAPI, callGeminiAPI } from "@/lib/data/aiRepository";
 import { ONBOARDING_TEAM_ROLES } from "@/lib/data/roleRepository";
 
 const STEPS = [
@@ -34,13 +33,20 @@ export default function HiveOnboardingWizard({
   const [selectedRoleId, setSelectedRoleId] = useState(ONBOARDING_TEAM_ROLES[0].id);
   const [inviteInput, setInviteInput] = useState("");
   const [invites, setInvites] = useState([]);
-  const [greeting, setGreeting] = useState("");
-  const [loadingGreeting, setLoadingGreeting] = useState(false);
 
   const deferredHiveName = useDeferredValue(hiveName.trim());
   const selectedRole = useMemo(
     () => ONBOARDING_TEAM_ROLES.find((role) => role.id === selectedRoleId) || ONBOARDING_TEAM_ROLES[0],
     [selectedRoleId]
+  );
+  const previewGreeting = useMemo(
+    () =>
+      buildFallbackGreeting({
+        hiveName: deferredHiveName || "your hive",
+        roleLabel: selectedRole.label,
+        userName: user?.displayName || user?.email?.split("@")[0] || "there",
+      }),
+    [deferredHiveName, selectedRole.label, user?.displayName, user?.email]
   );
 
   useEffect(() => {
@@ -50,83 +56,7 @@ export default function HiveOnboardingWizard({
     setSelectedRoleId(ONBOARDING_TEAM_ROLES[0].id);
     setInviteInput("");
     setInvites([]);
-    setGreeting("");
-    setLoadingGreeting(false);
   }, [open]);
-
-  useEffect(() => {
-    if (!open || !deferredHiveName || !selectedRole) {
-      setGreeting("");
-      return;
-    }
-
-    let cancelled = false;
-    const userName = user?.displayName || user?.email?.split("@")[0] || "there";
-
-    async function generateGreeting() {
-      try {
-        setLoadingGreeting(true);
-
-        const prompt = `
-You are writing the very first AI greeting inside HiveMind for a newly created workspace.
-
-Workspace name: ${deferredHiveName}
-Team role: ${selectedRole.label}
-User name: ${userName}
-
-Return plain text only.
-Write 2 short sentences max.
-Sound sharp, warm, and product-ready.
-Mention how the assistant will help this person inside the hive.
-        `.trim();
-
-        let reply = await callClaudeAPI(prompt, {
-          context: {
-            feature: "onboarding_greeting",
-          },
-        });
-
-        if (
-          !reply ||
-          /not configured|failed to get|error connecting|authentication required/i.test(
-            String(reply)
-          )
-        ) {
-          reply = await callGeminiAPI(prompt, "gemini-2.5-flash", [], {
-            feature: "onboarding_greeting",
-          });
-        }
-
-        if (!cancelled) {
-          const nextGreeting = String(reply || "").trim();
-          setGreeting(
-            nextGreeting || buildFallbackGreeting({ hiveName: deferredHiveName, roleLabel: selectedRole.label, userName })
-          );
-        }
-      } catch (error) {
-        console.error("Failed to generate onboarding greeting:", error);
-        if (!cancelled) {
-          setGreeting(
-            buildFallbackGreeting({
-              hiveName: deferredHiveName,
-              roleLabel: selectedRole.label,
-              userName,
-            })
-          );
-        }
-      } finally {
-        if (!cancelled) {
-          setLoadingGreeting(false);
-        }
-      }
-    }
-
-    generateGreeting();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [deferredHiveName, open, selectedRole, user?.displayName, user?.email]);
 
   if (!open) return null;
 
@@ -156,13 +86,7 @@ Mention how the assistant will help this person inside the hive.
       hiveName: hiveName.trim(),
       teamRole: selectedRole,
       invites,
-      greeting:
-        greeting ||
-        buildFallbackGreeting({
-          hiveName: hiveName.trim(),
-          roleLabel: selectedRole.label,
-          userName: user?.displayName || user?.email?.split("@")[0] || "there",
-        }),
+      greeting: previewGreeting,
     });
   };
 
@@ -266,17 +190,8 @@ Mention how the assistant will help this person inside the hive.
             </div>
 
             <div className="mission-greeting-preview mt-6">
-              <div className="mission-greeting-preview-label">AI first message preview</div>
-              <p>
-                {loadingGreeting
-                  ? "Generating a role-aware greeting..."
-                  : greeting ||
-                    buildFallbackGreeting({
-                      hiveName: deferredHiveName || "your hive",
-                      roleLabel: selectedRole.label,
-                      userName: user?.displayName || user?.email?.split("@")[0] || "there",
-                    })}
-              </p>
+              <div className="mission-greeting-preview-label">First message preview</div>
+              <p>{previewGreeting}</p>
             </div>
           </section>
         ) : null}
@@ -337,14 +252,7 @@ Mention how the assistant will help this person inside the hive.
 
             <div className="mission-greeting-preview mt-6">
               <div className="mission-greeting-preview-label">Ready to launch</div>
-              <p>
-                {greeting ||
-                  buildFallbackGreeting({
-                    hiveName: deferredHiveName || "your hive",
-                    roleLabel: selectedRole.label,
-                    userName: user?.displayName || user?.email?.split("@")[0] || "there",
-                  })}
-              </p>
+              <p>{previewGreeting}</p>
             </div>
           </section>
         ) : null}

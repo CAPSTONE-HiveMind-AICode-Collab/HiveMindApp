@@ -17,10 +17,81 @@ const RESPONSE_EXAMPLES = {
   },
 };
 
+const AI_RESPONSE_ISSUE_RULES = [
+  {
+    kind: "quota",
+    pattern:
+      /^You exceeded your current .*quota.*$|^.*quota exceeded.*$|^.*billing.*quota.*$/i,
+  },
+  {
+    kind: "throttled",
+    pattern:
+      /^Gemini temporarily throttled the request \(429\)\.?$|^.*Too Many Requests.*$|^.*RESOURCE_EXHAUSTED.*$|^.*rate limit.*$|^.*temporarily throttled.*$/i,
+  },
+  {
+    kind: "auth",
+    pattern:
+      /^Authentication required\.?$|^Invalid or expired token\.?$|^You do not have access to this hive\.?$/i,
+  },
+  {
+    kind: "config",
+    pattern:
+      /^.*not configured.*$|^No AI API key configured\..*$|^AI provider failed and no fallback provider is configured\.?$/i,
+  },
+  {
+    kind: "service",
+    pattern:
+      /^Failed to get AI response\.?$|^Error connecting to AI service\.?$|^.*could not respond right now\.?$/i,
+  },
+];
+
+function unwrapAIErrorMessage(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value.trim();
+
+  if (typeof value === "object") {
+    const directMessage = [value.message, value.error, value.details].find(
+      (item) => typeof item === "string" && item.trim()
+    );
+    return String(directMessage || "").trim();
+  }
+
+  return String(value).trim();
+}
+
+function normalizeAIErrorResponse(response, data) {
+  const message =
+    unwrapAIErrorMessage(data?.error) || unwrapAIErrorMessage(data?.message);
+
+  if (message) return message;
+
+  if (response.status === 429) {
+    return "Gemini temporarily throttled the request (429).";
+  }
+
+  if (response.status >= 500) {
+    return "Gemini could not respond right now.";
+  }
+
+  return "Failed to get AI response.";
+}
+
+export function getAIResponseIssue(value) {
+  const text = unwrapAIErrorMessage(value);
+  if (!text) return null;
+
+  const matchedRule = AI_RESPONSE_ISSUE_RULES.find((rule) => rule.pattern.test(text));
+  if (!matchedRule) return null;
+
+  return {
+    kind: matchedRule.kind,
+    message: text,
+  };
+}
+
 async function callAIRequest({
   message,
   model,
-  provider = "gemini",
   history = [],
   context = null,
 }) {
@@ -36,19 +107,13 @@ async function callAIRequest({
     const response = await fetch("/api/ai", {
       method: "POST",
       headers,
-      body: JSON.stringify({ message, model, provider, history, context }),
+      body: JSON.stringify({ message, model, history, context }),
     });
 
     const data = await response.json().catch(() => ({}));
 
-    if (response.status === 429) {
-      return provider === "anthropic"
-        ? "Claude rate limit/quota exceeded (429)."
-        : "Gemini rate limit/quota exceeded (429).";
-    }
-
     if (!response.ok) {
-      return data?.error || "Failed to get AI response";
+      return normalizeAIErrorResponse(response, data);
     }
 
     return data.reply || "No response generated.";
@@ -66,24 +131,6 @@ export async function callGeminiAPI(userText, model, history = [], context = nul
   return callAIRequest({
     message: userText,
     model,
-    provider: "gemini",
-    history,
-    context,
-  });
-}
-
-export async function callClaudeAPI(
-  userText,
-  {
-    model = process.env.NEXT_PUBLIC_ANTHROPIC_MODEL || "claude-3-5-sonnet-latest",
-    history = [],
-    context = null,
-  } = {}
-) {
-  return callAIRequest({
-    message: userText,
-    model,
-    provider: "anthropic",
     history,
     context,
   });

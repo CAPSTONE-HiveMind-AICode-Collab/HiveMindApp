@@ -1,9 +1,13 @@
 import JoinHoneycombRequest from "@/components/JoinHoneycombRequest";
+import BackButton from "@/components/BackButton";
 
 export default function JoinPage() {
   return (
     <div className="page-shell">
       <div className="page-frame">
+        <div className="mb-4">
+          <BackButton fallback="/dashboard" />
+        </div>
         <section className="hero-panel">
           <div className="stack-grid items-start">
             <div className="space-y-5">

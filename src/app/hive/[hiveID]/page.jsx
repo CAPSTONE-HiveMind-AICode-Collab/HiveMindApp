@@ -14,11 +14,9 @@ import {
 import { checkPermission } from "@/lib/business/permissionService";
 import { getAllUnreadCounts, updateLastSeen } from "@/lib/business/chatService";
 import { subscribeToHivePresence, syncHivePresence } from "@/lib/data/presenceRepository";
-import MonitoringDashboard from "@/components/MonitoringDashboard";
-import AuditLogViewer from "@/components/AuditLogViewer";
 import IAMAdminPanel from "@/components/IAMAdminPanel";
 import PermissionBadge from "@/components/PermissionBadge";
-import HiveGuard from "@/components/HiveGuard"; // Restored Import
+import HiveGuard from "@/components/HiveGuard";
 import DecisionMemoryPanel from "@/components/DecisionMemoryPanel";
 import TaskBoard from "@/components/TaskBoard";
 import WorkspaceOverviewPanel from "@/components/WorkspaceOverviewPanel";
@@ -79,7 +77,9 @@ export default function HivePage() {
 
         const isMember = memberList.some((member) => member.uid === user.uid);
         if (!isMember) {
-          alert("You do not have access to this hive.");
+          alert(
+            "You do not have access to this hive. You need to request access via a honeycomb invitation."
+          );
           router.push("/dashboard");
           return;
         }
@@ -222,7 +222,7 @@ export default function HivePage() {
 
     const allowed = userRole ? checkPermission(userRole, "CREATE_HONEYCOMB") : true;
     if (!allowed) {
-      alert("You do not have permission to create honeycombs.");
+      alert("You do not have permission to create honeycombs in this hive.");
       return;
     }
 
@@ -254,7 +254,7 @@ export default function HivePage() {
   const copyHoneycombId = async (honeycombID, event) => {
     event.stopPropagation();
     await navigator.clipboard.writeText(honeycombID);
-    alert("Honeycomb ID copied.");
+    alert("Honeycomb ID copied. Share it so people can request access.");
   };
 
   const enterHive = async () => {
@@ -265,6 +265,7 @@ export default function HivePage() {
       setShowBriefing(false);
     } catch (error) {
       console.error("Failed to mark briefing as seen:", error);
+      alert("Could not close the briefing right now.");
     }
   };
 
@@ -275,7 +276,6 @@ export default function HivePage() {
       ),
     [honeycombs]
   );
-  
   const roomStatsById = useMemo(() => {
     return Object.fromEntries(
       honeycombs.map((room) => {
@@ -307,6 +307,7 @@ export default function HivePage() {
       <div className="page-shell">
         <div className="page-frame">
           <section className="hero-panel">
+            <p className="text-kicker">Hive</p>
             <h1 className="text-display">
               <span className="text-gradient">Loading access</span>
             </h1>
@@ -326,6 +327,7 @@ export default function HivePage() {
       <div className="page-shell">
         <div className="page-frame">
           <section className="hero-panel">
+            <p className="text-kicker">Hive</p>
             <h1 className="text-display">
               <span className="text-gradient">Checking permissions</span>
             </h1>
@@ -336,9 +338,10 @@ export default function HivePage() {
   }
 
   const hiveTitle = String(hiveMeta?.name || hiveID);
-  const hiveSubtitle = String(hiveMeta?.description || "").trim() || "Workspace management and AI context.";
+  const hiveSubtitle =
+    String(hiveMeta?.description || "").trim() ||
+    "Discussion rooms, decision memory, task execution, and AI context for this team.";
   const ownerAccess = userRole === "OWNER";
-  const adminAccess = userRole === "ADMIN" || userRole === "OWNER";
 
   return (
     <div className="page-shell">
@@ -362,6 +365,7 @@ export default function HivePage() {
               <div className="workspace-meta-strip">
                 <span className="status-pill">Role: {userRole}</span>
                 <span className="status-pill">{members.length} members</span>
+                <span className="status-pill">{honeycombs.length} rooms</span>
               </div>
 
               <div className="workspace-topbar-buttons">
@@ -369,6 +373,7 @@ export default function HivePage() {
                   <UserAvatar user={user} className="workspace-user-avatar" size="md" />
                   <div className="workspace-user-copy">
                     <strong>{user.displayName || user.email?.split("@")[0] || "User"}</strong>
+                    <span>{user.email || "Signed in"}</span>
                   </div>
                 </div>
                 <div className="hud-panel workspace-permission-card">
@@ -399,7 +404,7 @@ export default function HivePage() {
           </div>
         </section>
 
-        {activeTab === "workspace" && (
+        {activeTab === "workspace" ? (
           <WorkspaceOverviewPanel
             hiveID={String(hiveID)}
             hiveName={hiveTitle}
@@ -414,13 +419,16 @@ export default function HivePage() {
             onOpenDecisionMemory={() => setActiveTab("work")}
             onOpenTaskBoard={() => setActiveTab("work")}
           />
-        )}
+        ) : null}
 
-        {activeTab === "work" && (
+        {activeTab === "work" ? (
           <>
             <section className="stack-grid">
               <div className="glass-panel">
                 <p className="panel-title">Create a honeycomb</p>
+                <p className="panel-subtitle">
+                  Start a focused conversation room inside this hive.
+                </p>
                 <div className="action-row mt-5">
                   <input
                     type="text"
@@ -437,52 +445,142 @@ export default function HivePage() {
 
               <div className="glass-panel">
                 <p className="panel-title">Member directory</p>
-                <div className="card-grid mt-6">
-                  {members.map((member) => (
-                    <article key={member.uid} className="surface-card">
-                      <div className="surface-card-inner">
-                        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                          <div className="flex min-w-0 items-center gap-4">
-                            <UserAvatar
-                              name={member.displayName}
-                              email={member.email}
-                              photoURL={member.photoURL}
-                              className="workspace-member-avatar"
-                              size="fill"
-                            />
-                            <div className="min-w-0 text-white font-semibold truncate">
-                              {member.displayName || member.email || member.uid}
+                <p className="panel-subtitle">
+                  Everyone currently attached to this hive and the role they hold.
+                </p>
+
+                {members.length === 0 ? (
+                  <div className="empty-state mt-6">No member records yet.</div>
+                ) : (
+                  <div className="card-grid mt-6">
+                    {members.map((member) => (
+                      <article key={member.uid} className="surface-card">
+                        <div className="surface-card-inner">
+                          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                            <div className="flex min-w-0 items-center gap-4">
+                              <UserAvatar
+                                name={member.displayName}
+                                email={member.email}
+                                photoURL={member.photoURL}
+                                className="workspace-member-avatar"
+                                size="fill"
+                              />
+                              <div className="min-w-0">
+                                <div className="truncate font-semibold text-white">
+                                  {member.displayName || member.email || member.uid}
+                                </div>
+                                {member.email ? (
+                                  <div className="mt-1 truncate text-sm text-slate-300">
+                                    {member.email}
+                                  </div>
+                                ) : null}
+                              </div>
                             </div>
+                            <span
+                              className={`self-start rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em] ${
+                                roleTone[member.role] || roleTone.VIEWER
+                              }`}
+                            >
+                              {member.role}
+                            </span>
                           </div>
-                          <span className={`rounded-full px-3 py-1 text-xs font-semibold uppercase ${roleTone[member.role] || roleTone.VIEWER}`}>
-                            {member.role}
-                          </span>
                         </div>
-                      </div>
-                    </article>
-                  ))}
-                </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
               </div>
             </section>
 
             <section className="glass-panel">
-              <h2 className="panel-title text-2xl">Honeycomb list</h2>
-              <div className="card-grid mt-6">
-                {honeycombs.map((honeycomb) => (
-                  <article key={honeycomb.id} className="surface-card cursor-pointer" onClick={() => openHoneycomb(honeycomb.id)}>
-                    <div className="surface-card-inner space-y-5">
-                      <p className="panel-title">{honeycomb.displayName || honeycomb.name || "Untitled room"}</p>
-                      <button className="button-primary" type="button">Open room</button>
-                    </div>
-                  </article>
-                ))}
+              <div className="chat-header">
+                <div>
+                  <p className="text-kicker">Channels</p>
+                  <h2 className="panel-title text-2xl">Honeycomb list</h2>
+                </div>
+                <span className="status-pill">
+                  {honeycombs.length === 1 ? "1 room" : `${honeycombs.length} rooms`}
+                </span>
               </div>
+
+              {honeycombs.length === 0 ? (
+                <div className="empty-state mt-6">
+                  No honeycombs yet. Create the first conversation room for this hive.
+                </div>
+              ) : (
+                <div className="card-grid mt-6">
+                  {honeycombs.map((honeycomb) => {
+                    const roomLabel = honeycomb.displayName || honeycomb.name || "Untitled room";
+                    const roomStats = roomStatsById[honeycomb.id] || { decisions: 0, openTasks: 0 };
+
+                    return (
+                      <article
+                        key={honeycomb.id}
+                        className="surface-card cursor-pointer"
+                        onClick={() => openHoneycomb(honeycomb.id)}
+                      >
+                        <div className="surface-card-inner space-y-5">
+                          <div className="flex items-start justify-between gap-4">
+                            <div>
+                              <p className="panel-title">{roomLabel}</p>
+                              <p className="panel-subtitle">
+                                Open the live chat, decisions, tasks, and AI support for this room.
+                              </p>
+                            </div>
+                            {(unreadCounts[honeycomb.id] || 0) > 0 ? (
+                              <span className="status-pill bg-rose-300/15 text-rose-100">
+                                {unreadCounts[honeycomb.id]} unread
+                              </span>
+                            ) : null}
+                          </div>
+
+                          <div className="flex flex-wrap gap-2">
+                            <span className="status-pill">
+                              {roomStats.decisions} {roomStats.decisions === 1 ? "decision" : "decisions"}
+                            </span>
+                            <span className="status-pill">
+                              {roomStats.openTasks} open {roomStats.openTasks === 1 ? "task" : "tasks"}
+                            </span>
+                            <span className="status-pill">Display name only in workspace</span>
+                          </div>
+
+                          <div className="action-row">
+                            <button
+                              onClick={(event) => copyHoneycombId(honeycomb.id, event)}
+                              className="button-secondary"
+                              type="button"
+                            >
+                              Copy invite code
+                            </button>
+                            <button
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                openHoneycomb(honeycomb.id);
+                              }}
+                              className="button-primary"
+                              type="button"
+                            >
+                              Open room
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
             </section>
 
             <DecisionMemoryPanel
+              hiveID={String(hiveID)}
               decisions={decisions}
               roomNameById={roomNameById}
               onOpenThread={openSourceThread}
+              onOpenTasksTab={(decisionID) => {
+                setHighlightDecisionId(decisionID || "");
+                setTaskDecisionFilterId(decisionID || "");
+                setActiveTab("work");
+              }}
               highlightDecisionId={highlightDecisionId}
             />
 
@@ -495,58 +593,70 @@ export default function HivePage() {
               filterDecisionId={taskDecisionFilterId}
               onClearDecisionFilter={() => setTaskDecisionFilterId("")}
               onOpenSource={openSourceThread}
+              onOpenDecision={(decisionID) => {
+                setTaskDecisionFilterId("");
+                setHighlightDecisionId(decisionID || "");
+                setActiveTab("work");
+              }}
             />
           </>
-        )}
+        ) : null}
 
-        {activeTab === "admin" && (
-          <div className="space-y-6">
+        {activeTab === "admin" ? (
+          ownerAccess ? (
+            <>
+              <section className="glass-panel overflow-visible">
+                <IAMAdminPanel hiveID={String(hiveID)} />
+              </section>
 
-            {/* ADMIN & OWNER SECTION (Restored Hive Guard) */}
-            {adminAccess ? (
               <section className="glass-panel overflow-visible">
                 <HiveGuard hiveID={String(hiveID)} currentUserRole={userRole} />
               </section>
-            ) : (
-              <section className="glass-panel">
-                <h2 className="panel-title text-2xl text-white">Owner controls only</h2>
-                <p className="panel-subtitle">Contact an owner for elevated access to monitoring and IAM logs.</p>
-              </section>
-            )}
+            </>
+          ) : (
+            <section className="glass-panel">
+              <div className="space-y-4">
+                <span className="hero-chip">Admin</span>
+                <div>
+                  <h2 className="panel-title text-2xl text-white">Owner controls only</h2>
+                  <p className="panel-subtitle">
+                    IAM administration and HiveGuard remain grouped here, but only owners can open
+                    them.
+                  </p>
+                </div>
 
-            {/* OWNER ONLY SECTION */}
-            {ownerAccess && (
-              <>
-                <section className="glass-panel overflow-visible">
-                  <MonitoringDashboard hiveID={String(hiveID)} />
-                </section>
-                <section className="glass-panel overflow-visible">
-                  <AuditLogViewer hiveID={String(hiveID)} limit={100} />
-                </section>
-                <section className="glass-panel overflow-visible">
-                  <IAMAdminPanel hiveID={String(hiveID)} />
-                </section>
-              </>
-            )}
-
-            
-          </div>
-        )}
+                <div className="hud-panel">
+                  <div className="text-xs uppercase tracking-[0.2em] text-slate-300/60">
+                    Your access
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-3">
+                    <span className="status-pill">Role: {userRole}</span>
+                    <span className="status-pill">Contact an owner for elevated access</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+          )
+        ) : null}
       </div>
 
-      {showBriefing && (
+      {showBriefing ? (
         <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-950/82 p-4 backdrop-blur-sm">
           <div className="mx-auto max-w-6xl pt-6">
             <NewMemberBriefPanel
               hiveID={String(hiveID)}
               hiveName={hiveTitle}
               currentUser={user}
-              onEnterHive={enterHive}
+              decisions={decisions}
+              tasks={tasks}
+              honeycombs={honeycombs}
+              onOpenThread={openSourceThread}
               entryMode
+              onEnterHive={enterHive}
             />
           </div>
         </div>
-      )}
+      ) : null}
     </div>
   );
 }
