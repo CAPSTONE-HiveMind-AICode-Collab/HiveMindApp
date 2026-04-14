@@ -1,5 +1,6 @@
 // src/app/layout.js
 import "./globals.css";
+import "@xterm/xterm/css/xterm.css";
 import { UserProvider } from "../lib/auth/userContext";
 import ClientLayout from "./ClientLayout"; // your client-side wrapper for notifications
 import ErrorBoundary from "@/components/ErrorBoundary";

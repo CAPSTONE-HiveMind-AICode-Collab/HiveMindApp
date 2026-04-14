@@ -27,6 +27,7 @@ import {
 } from "@/lib/data/hiveRepository";
 import HiveOnboardingWizard from "@/components/HiveOnboardingWizard";
 import UserAvatar from "@/components/UserAvatar";
+import BackButton from "@/components/BackButton";
 
 function toDate(value) {
   if (!value) return null;
@@ -603,6 +604,9 @@ export default function Dashboard() {
     return (
       <div className="page-shell">
         <div className="page-frame">
+          <div className="mb-4">
+            <BackButton fallback="/" />
+          </div>
           <div className="mission-window">
             <div className="mission-window-bar">
               <div className="mission-window-dots" aria-hidden="true">
@@ -634,6 +638,9 @@ export default function Dashboard() {
   return (
     <div className="page-shell">
       <div className="page-frame">
+        <div className="mb-4">
+          <BackButton fallback="/" />
+        </div>
         <div className="mission-window">
           <div className="mission-window-bar">
             <div className="mission-window-dots" aria-hidden="true">

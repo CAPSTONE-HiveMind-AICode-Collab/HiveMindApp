@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 
 export default function TaskStatusModal({
   open,
@@ -12,6 +13,12 @@ export default function TaskStatusModal({
 }) {
   const [blockReason, setBlockReason] = useState(initialBlockReason);
   const [saving, setSaving] = useState(false);
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+    return () => setMounted(false);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -20,6 +27,7 @@ export default function TaskStatusModal({
   }, [initialBlockReason, open]);
 
   if (!open) return null;
+  if (!mounted) return null;
 
   const submit = async () => {
     try {
@@ -42,7 +50,7 @@ export default function TaskStatusModal({
     }
   };
 
-  return (
+  const modal = (
     <div
       className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-950/78 p-4 backdrop-blur-sm"
       onClick={onClose}
@@ -88,4 +96,6 @@ export default function TaskStatusModal({
       </div>
     </div>
   );
+
+  return createPortal(modal, document.body);
 }

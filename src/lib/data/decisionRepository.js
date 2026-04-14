@@ -2,6 +2,7 @@ import { db } from "@/lib/firebase/config";
 import {
   arrayUnion,
   collection,
+  deleteDoc,
   doc,
   getDoc,
   getDocs,
@@ -11,7 +12,6 @@ import {
   setDoc,
   updateDoc,
 } from "firebase/firestore";
-import { callGeminiAPI } from "@/lib/data/aiRepository";
 import { normalizeDecisionRecordPayload } from "@/lib/ai/structuredOutput";
 import { syncHiveDirectoryMetrics } from "@/lib/data/hiveRepository";
 import {
@@ -148,6 +148,65 @@ export async function createDecisionRecord({
   await syncHiveDirectoryMetrics(String(hiveID), { touchLastActive: true });
 
   return recordRef.id;
+}
+
+export async function deleteDecisionRecord({ hiveID, decisionID }) {
+  if (!hiveID || !decisionID) {
+    throw new Error("hiveID and decisionID are required");
+  }
+
+  const hid = String(hiveID);
+  const did = String(decisionID);
+  const decisionRef = doc(db, "Hive", hid, "decisionRecords", did);
+
+  const tasksRef = collection(db, "Hive", hid, "tasks");
+  const tasksSnapshot = await getDocs(tasksRef);
+  await Promise.all(
+    tasksSnapshot.docs
+      .filter((taskDoc) => String(taskDoc.data()?.linkedDecisionId || "") === did)
+      .map((taskDoc) =>
+        updateDoc(taskDoc.ref, {
+          linkedDecisionId: "",
+          linkedDecisionTitle: "",
+          sourcePreview: {
+            ...(taskDoc.data()?.sourcePreview || {}),
+            decisionTitle: "",
+            decisionSummary: "",
+          },
+          updatedAt: serverTimestamp(),
+        })
+      )
+  );
+
+  const decisionsRef = collection(db, "Hive", hid, "decisionRecords");
+  const decisionsSnapshot = await getDocs(decisionsRef);
+  await Promise.all(
+    decisionsSnapshot.docs
+      .filter((recordDoc) => recordDoc.id !== did)
+      .map(async (recordDoc) => {
+        const data = recordDoc.data() || {};
+        const patch = {};
+
+        if (String(data.supersedesDecisionId || "") === did) {
+          patch.supersedesDecisionId = "";
+        }
+
+        if (String(data.supersededByDecisionId || "") === did) {
+          patch.supersededByDecisionId = "";
+          if (String(data.status || "").toLowerCase() === DECISION_STATUSES.SUPERSEDED) {
+            patch.status = DECISION_STATUSES.ACTIVE;
+          }
+        }
+
+        if (Object.keys(patch).length) {
+          patch.updatedAt = serverTimestamp();
+          await updateDoc(recordDoc.ref, patch);
+        }
+      })
+  );
+
+  await deleteDoc(decisionRef);
+  await syncHiveDirectoryMetrics(hid, { touchLastActive: true });
 }
 
 export async function listDecisionRecords(hiveID) {
@@ -320,56 +379,10 @@ export async function generateAndStoreDecisionRecordForThread({
     String(parentMessageID),
     "Threads"
   );
-  const threadSnapshot = await getDocs(query(threadRef, orderBy("timestamp", "asc")));
-  const threadMessages = threadSnapshot.docs.map((item) => ({
-    id: item.id,
-    ...item.data(),
-  }));
+  await getDocs(query(threadRef, orderBy("timestamp", "asc")));
 
   const fallback = parseSummaryText(summaryText, parentText);
-  const discussion = [
-    parentText ? `Original topic: ${parentText}` : "",
-    ...threadMessages.map(
-      (message) => `${message.sender || "User"}: ${String(message.text || "").trim()}`
-    ),
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  let normalized = normalizeDecisionRecordPayload(null, fallback);
-
-  if (discussion) {
-    const prompt = `
-You are converting a finished collaboration thread into a structured decision record.
-Return ONLY raw JSON with this exact shape:
-{
-  "title": "short title",
-  "summary": "2-4 sentence summary",
-  "rationale": "why the team chose this direction",
-  "decision": "final decision in one concise paragraph",
-  "tags": ["tag"],
-  "risks": ["risk"],
-  "actionItems": ["follow-up item"]
-}
-
-Keep the answer grounded in the discussion. Do not invent facts.
-
-Discussion:
-${discussion}
-
-Existing summary:
-${String(summaryText || "").trim() || "(none)"}
-    `.trim();
-
-    const aiResponse = await callGeminiAPI(prompt, "gemini-2.5-flash", [], {
-      hiveID: String(hiveID),
-      honeycombID: String(honeycombID),
-      feature: "decision_record",
-      scope: "message",
-    });
-
-    normalized = normalizeDecisionRecordPayload(aiResponse, fallback);
-  }
+  const normalized = normalizeDecisionRecordPayload(null, fallback);
 
   const decisionRecord = {
     title: String(normalized?.title || fallback.title || "").trim(),

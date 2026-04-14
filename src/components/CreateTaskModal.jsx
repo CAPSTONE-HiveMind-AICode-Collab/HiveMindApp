@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 
 const STATUSES = ["todo", "doing", "blocked", "done"];
 const PRIORITIES = ["low", "medium", "high"];
+const EMPTY_ASSIGNEES = [];
 
 function guessTitle(text) {
   const value = String(text || "").trim();
@@ -30,12 +32,41 @@ export default function CreateTaskModal({
   members = [],
   decisionOptions = [],
   initialDecisionId = "",
-  initialAssignees = [],
+  initialAssignees = EMPTY_ASSIGNEES,
+  initialTask = null,
   titleOverride = "Create task",
   subtitleOverride = "Turn the chat context into something the team can track, assign, and ship.",
   submitLabel = "Save task",
 }) {
+  const normalizedInitialAssignees = useMemo(
+    () => (Array.isArray(initialAssignees) ? [...initialAssignees] : []),
+    [initialAssignees]
+  );
+
   const initial = useMemo(() => {
+    if (initialTask && typeof initialTask === "object") {
+      const dueDateValue = initialTask?.dueAt?.toDate
+        ? initialTask.dueAt.toDate()
+        : initialTask?.dueAt
+          ? new Date(initialTask.dueAt)
+          : null;
+
+      return {
+        title: String(initialTask.title || "New Task"),
+        description: String(initialTask.description || ""),
+        checklist: Array.isArray(initialTask.checklist) ? initialTask.checklist : [],
+        status: String(initialTask.status || "todo"),
+        priority: String(initialTask.priority || "medium"),
+        blockReason: String(initialTask.blockReason || ""),
+        dueDate:
+          dueDateValue && !Number.isNaN(dueDateValue.getTime())
+            ? dueDateValue.toISOString().slice(0, 10)
+            : "",
+        assignees: Array.isArray(initialTask.assignees) ? initialTask.assignees : normalizedInitialAssignees,
+        linkedDecisionId: String(initialTask.linkedDecisionId || initialDecisionId || ""),
+      };
+    }
+
     const combined = [messageText, attachmentText].filter(Boolean).join("\n\n");
     return {
       title: guessTitle(messageText) || "New Task",
@@ -45,10 +76,10 @@ export default function CreateTaskModal({
       priority: "medium",
       blockReason: "",
       dueDate: "",
-      assignees: Array.isArray(initialAssignees) ? initialAssignees : [],
+      assignees: normalizedInitialAssignees,
       linkedDecisionId: String(initialDecisionId || ""),
     };
-  }, [attachmentText, initialAssignees, initialDecisionId, messageText]);
+  }, [attachmentText, initialDecisionId, initialTask, messageText, normalizedInitialAssignees]);
 
   const [title, setTitle] = useState(initial.title);
   const [description, setDescription] = useState(initial.description);
@@ -60,6 +91,12 @@ export default function CreateTaskModal({
   const [assignees, setAssignees] = useState(initial.assignees);
   const [linkedDecisionId, setLinkedDecisionId] = useState(initial.linkedDecisionId);
   const [saving, setSaving] = useState(false);
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+    return () => setMounted(false);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -117,34 +154,35 @@ export default function CreateTaskModal({
     }
   };
 
-  return (
+  if (!mounted) return null;
+
+  const modal = (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-slate-950/75 p-4 backdrop-blur-sm sm:items-center"
       onClick={onClose}
     >
       <div
-        className="glass-panel w-full max-w-3xl border border-cyan-300/18"
+        className="glass-panel flex max-h-[min(92vh,64rem)] w-full max-w-3xl flex-col overflow-hidden border border-cyan-300/18"
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="space-y-5">
-          <div className="chat-header">
+        <div className="chat-header flex-shrink-0 border-b border-white/10 pb-4">
             <div>
               <span className="hero-chip">Task extraction</span>
               <h2 className="panel-title mt-4 text-2xl">{titleOverride}</h2>
-              <p className="panel-subtitle mt-3">
-                {subtitleOverride}
-              </p>
+              <p className="panel-subtitle mt-3">{subtitleOverride}</p>
             </div>
 
             <button type="button" onClick={onClose} className="button-ghost">
               Close
             </button>
-          </div>
+        </div>
 
-          <label className="block">
+        <div className="mt-5 min-h-0 flex-1 overflow-y-auto pr-1">
+          <div className="space-y-5">
+            <label className="block">
             <span className="label-text">Title</span>
             <input className="input-shell" value={title} onChange={(event) => setTitle(event.target.value)} />
-          </label>
+            </label>
 
           <div className="grid gap-3 md:grid-cols-3">
             <label className="block">
@@ -285,16 +323,20 @@ export default function CreateTaskModal({
             </div>
           </div>
 
-          <div className="action-row justify-end">
-            <button type="button" onClick={onClose} className="button-ghost" disabled={saving}>
-              Cancel
-            </button>
-            <button type="button" onClick={submit} className="button-primary" disabled={saving}>
-              {saving ? "Saving..." : submitLabel}
-            </button>
           </div>
+        </div>
+
+        <div className="action-row mt-5 flex-shrink-0 justify-end border-t border-white/10 pt-4">
+          <button type="button" onClick={onClose} className="button-ghost" disabled={saving}>
+            Cancel
+          </button>
+          <button type="button" onClick={submit} className="button-primary" disabled={saving}>
+            {saving ? "Saving..." : submitLabel}
+          </button>
         </div>
       </div>
     </div>
   );
+
+  return createPortal(modal, document.body);
 }

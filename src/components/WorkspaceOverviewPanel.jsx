@@ -3,7 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { collection, getDocs, limit, orderBy, query } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
-import { callGeminiAPI } from "@/lib/data/aiRepository";
+import {
+  callGeminiAPI,
+  getAIResponseIssue,
+} from "@/lib/data/aiRepository";
 import { getLastSeen, updateLastSeen } from "@/lib/business/chatService";
 import UserAvatar from "@/components/UserAvatar";
 
@@ -61,6 +64,145 @@ function truncateText(value, maxLength = 160) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength - 1).trim()}...`;
+}
+
+function normalizeTaskStatus(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeAssigneeEntry(entry) {
+  if (!entry) {
+    return { uid: "", email: "", raw: "" };
+  }
+
+  if (typeof entry === "object") {
+    return {
+      uid: String(entry.uid || entry.id || "").trim(),
+      email: String(entry.email || "").trim().toLowerCase(),
+      raw: String(entry.displayName || entry.name || entry.uid || entry.id || "").trim(),
+    };
+  }
+
+  return {
+    uid: String(entry).trim(),
+    email: String(entry).trim().toLowerCase(),
+    raw: String(entry).trim(),
+  };
+}
+
+function normalizeIdentityValue(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isCurrentUserIdentity(value, currentUser) {
+  const candidate = normalizeIdentityValue(value);
+  if (!candidate) return false;
+
+  return [
+    currentUser?.uid,
+    currentUser?.email,
+    currentUser?.displayName,
+  ]
+    .map(normalizeIdentityValue)
+    .filter(Boolean)
+    .includes(candidate);
+}
+
+function isCurrentUserMember(member, currentUser) {
+  if (!member) return false;
+
+  const memberUid = String(member.uid || "").trim();
+  const memberEmail = String(member.email || "").trim().toLowerCase();
+
+  if (memberUid && memberUid === String(currentUser?.uid || "").trim()) {
+    return true;
+  }
+
+  if (memberEmail && memberEmail === String(currentUser?.email || "").trim().toLowerCase()) {
+    return true;
+  }
+
+  return false;
+}
+
+function labelCurrentUser(value, currentUser) {
+  const label = String(value || "").trim();
+  if (!label) return "";
+  return isCurrentUserIdentity(label, currentUser) ? `${label} (You)` : label;
+}
+
+function resolveAssigneeLabels(task, membersById, currentUser) {
+  if (!Array.isArray(task?.assignees)) {
+    return [];
+  }
+
+  return task.assignees
+    .map((assignee) => {
+      const entry = normalizeAssigneeEntry(assignee);
+      const resolved =
+        membersById[entry.uid] ||
+        membersById[entry.email] ||
+        entry.raw ||
+        entry.email ||
+        entry.uid;
+
+      return labelCurrentUser(resolved, currentUser);
+    })
+    .filter(Boolean);
+}
+
+function isTaskAssignedToMember(task, member) {
+  const assignees = Array.isArray(task?.assignees)
+    ? task.assignees.map(normalizeAssigneeEntry)
+    : [];
+  const memberUid = String(member?.uid || "").trim();
+  const memberEmail = String(member?.email || "").trim().toLowerCase();
+
+  if (memberUid && assignees.some((entry) => entry.uid === memberUid)) {
+    return true;
+  }
+
+  if (memberEmail && assignees.some((entry) => entry.email === memberEmail)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isTaskAssignedToCurrentUser(task, currentUser) {
+  const assignees = Array.isArray(task?.assignees)
+    ? task.assignees.map(normalizeAssigneeEntry)
+    : [];
+  const uid = String(currentUser?.uid || "");
+  const email = String(currentUser?.email || "").toLowerCase();
+
+  if (uid && assignees.some((entry) => entry.uid === uid)) {
+    return true;
+  }
+
+  if (email && assignees.some((entry) => entry.email === email)) {
+    return true;
+  }
+
+  return false;
+}
+
+function rankTaskPriority(value) {
+  const priority = String(value || "").trim().toLowerCase();
+  if (priority === "critical") return 0;
+  if (priority === "high") return 1;
+  if (priority === "medium") return 2;
+  if (priority === "low") return 3;
+  return 4;
+}
+
+function buildTaskLine(task, roomNameById, membersById, currentUser) {
+  const roomId = String(task?.source?.honeycombID || task?.honeycombID || "");
+  const roomLabel = roomNameById?.[roomId] || roomId || "workspace";
+  const assigneeLabels = resolveAssigneeLabels(task, membersById, currentUser);
+  const assigneeText = assigneeLabels.length ? assigneeLabels.join(", ") : "unassigned";
+
+  return `- ${task.title || "Untitled task"} (${task.status || "todo"}, ${task.priority || "medium"} priority, assigned to ${assigneeText}, #${roomLabel})`;
 }
 
 function getTaskDueValue(task) {
@@ -127,6 +269,26 @@ function buildFallbackCatchup({ hiveName, messages, decisions, tasks }) {
   return parts.join(" ");
 }
 
+function buildCopilotUnavailableMessage(issue) {
+  if (issue?.kind === "throttled") {
+    return "The copilot is temporarily busy because the AI provider is throttling requests. Try again in a minute.";
+  }
+
+  if (issue?.kind === "quota") {
+    return "The copilot is temporarily unavailable because the current AI quota is exhausted right now. Try again in a minute.";
+  }
+
+  if (issue?.kind === "auth") {
+    return "The copilot could not verify your access right now. Refresh the page and try again.";
+  }
+
+  return "The project copilot could not respond right now.";
+}
+
+async function requestWorkspaceAssistant(prompt, context) {
+  return callGeminiAPI(prompt, "gemini-2.5-flash", [], context);
+}
+
 async function loadRecentHiveMessages(
   hiveID,
   honeycombs,
@@ -169,13 +331,13 @@ async function loadRecentHiveMessages(
     .slice(0, maxMessages);
 }
 
-function summarizeSourcesForPrompt(messages, decisions, tasks) {
+function summarizeSourcesForPrompt(messages, decisions, tasks, membersById = {}, currentUser = null) {
   return {
     messages: messages.slice(0, 8).map((message) => ({
       id: message.id,
       honeycombID: message.honeycombID || "",
       honeycombName: message.honeycombName || message.honeycombID || "Room",
-      sender: message.sender || "User",
+      sender: labelCurrentUser(message.sender || "User", currentUser),
       text: truncateText(message.text || "No message text", 180),
       timestamp: formatRelativeTime(message.timestamp),
     })),
@@ -183,7 +345,10 @@ function summarizeSourcesForPrompt(messages, decisions, tasks) {
       id: decision.id,
       title: decision.title || "Decision Record",
       summary: truncateText(decision.summary || decision.decision || "No summary available.", 180),
-      owner: decision.ownerDisplayName || decision.createdByDisplayName || "Team",
+      owner: labelCurrentUser(
+        decision.ownerDisplayName || decision.createdByDisplayName || "Team",
+        currentUser
+      ),
       updatedAt: formatRelativeTime(decision.updatedAt || decision.createdAt || decision.closedAt),
       honeycombID: decision.honeycombID || decision.source?.honeycombID || "",
       parentMessageID: decision.parentMessageID || decision.source?.parentMessageID || "",
@@ -195,6 +360,21 @@ function summarizeSourcesForPrompt(messages, decisions, tasks) {
       priority: task.priority || "medium",
       linkedDecisionTitle: task.linkedDecisionTitle || "",
       blockReason: task.blockReason || "",
+      assignees: Array.isArray(task.assignees)
+        ? task.assignees.map((assignee) => {
+            const entry = normalizeAssigneeEntry(assignee);
+            const resolved =
+              membersById[entry.uid] ||
+              membersById[entry.email] ||
+              entry.raw ||
+              entry.email ||
+              entry.uid;
+            return {
+              id: entry.uid || entry.email || entry.raw,
+              label: labelCurrentUser(resolved, currentUser),
+            };
+          })
+        : [],
     })),
   };
 }
@@ -225,7 +405,6 @@ export default function WorkspaceOverviewPanel({
   onOpenTaskBoard,
 }) {
   const promptInputRef = useRef(null);
-  const lastCatchupKeyRef = useRef("");
   const catchupBaselineRef = useRef(0);
   const catchupBaselineLoadedRef = useRef(false);
   const catchupSeenMarkedRef = useRef(false);
@@ -239,7 +418,6 @@ export default function WorkspaceOverviewPanel({
   const [lastSources, setLastSources] = useState({ messages: [], decisions: [], tasks: [] });
 
   useEffect(() => {
-    lastCatchupKeyRef.current = "";
     catchupBaselineRef.current = 0;
     catchupBaselineLoadedRef.current = false;
     catchupSeenMarkedRef.current = false;
@@ -252,6 +430,20 @@ export default function WorkspaceOverviewPanel({
         honeycombs.map((room) => [String(room.id), room.displayName || room.name || room.id])
       ),
     [honeycombs]
+  );
+  const memberNameById = useMemo(
+    () =>
+      Object.fromEntries(
+        members.flatMap((member) => {
+          const label = member.displayName || member.email || member.uid;
+          const entries = [[String(member.uid), label]];
+          if (member.email) {
+            entries.push([String(member.email).trim().toLowerCase(), label]);
+          }
+          return entries;
+        })
+      ),
+    [members]
   );
   const openTasks = useMemo(
     () => tasks.filter((task) => isOpenTask(task)),
@@ -292,7 +484,7 @@ export default function WorkspaceOverviewPanel({
   const pulseEntries = useMemo(() => {
     return members
       .map((member) => {
-        const memberTasks = tasks.filter((task) => Array.isArray(task.assignees) && task.assignees.includes(member.uid));
+        const memberTasks = tasks.filter((task) => isTaskAssignedToMember(task, member));
         const blockedCount = memberTasks.filter((task) => isOverdueTask(task) || task.status === "blocked").length;
         const activeTask = memberTasks.find((task) =>
           ["doing", "in-progress", "todo"].includes(String(task.status || "").toLowerCase())
@@ -307,7 +499,10 @@ export default function WorkspaceOverviewPanel({
         const tone = hasPresence
           ? getPulseTone({ blockedCount, onlineState })
           : { label: "Unavailable", tone: "unavailable" };
-        const label = member.displayName || member.email || member.uid;
+        const label = labelCurrentUser(
+          member.displayName || member.email || member.uid,
+          isCurrentUserMember(member, currentUser) ? currentUser : null
+        );
 
         let detail = "No active assignments";
         if (blockedCount > 0) {
@@ -334,6 +529,7 @@ export default function WorkspaceOverviewPanel({
         return {
           uid: member.uid,
           label,
+          isCurrentUser: isCurrentUserMember(member, currentUser),
           photoURL: String(presence?.photoURL || member.photoURL || "").trim(),
           detail,
           activity,
@@ -345,9 +541,10 @@ export default function WorkspaceOverviewPanel({
       .sort((left, right) => {
         if (left.onlineRank !== right.onlineRank) return left.onlineRank - right.onlineRank;
         if (left.blockedCount !== right.blockedCount) return right.blockedCount - left.blockedCount;
+        if (left.isCurrentUser !== right.isCurrentUser) return left.isCurrentUser ? -1 : 1;
         return left.label.localeCompare(right.label);
       });
-  }, [members, presenceMap, roomNameById, tasks]);
+  }, [currentUser, members, presenceMap, roomNameById, tasks]);
 
   const topMetrics = useMemo(
     () => [
@@ -380,23 +577,6 @@ export default function WorkspaceOverviewPanel({
     [createdThisWeek.decisions, createdThisWeek.honeycombs, decisions.length, hasPresenceData, honeycombs.length, members.length, onlineCount, openTasks.length, overdueTasks.length]
   );
 
-  const catchupKey = useMemo(
-    () =>
-      [
-        String(hiveID),
-        honeycombs.map((item) => item.id).sort().join("|"),
-        decisions
-          .slice(0, 4)
-          .map((item) => `${item.id}:${toMillis(item.updatedAt || item.createdAt || item.closedAt)}`)
-          .join("|"),
-        tasks
-          .slice(0, 6)
-          .map((item) => `${item.id}:${item.status}:${toMillis(item.updatedAt || item.createdAt)}`)
-          .join("|"),
-      ].join("::"),
-    [decisions, hiveID, honeycombs, tasks]
-  );
-
   const requestCatchup = useCallback(async (detail = "brief", sinceMs = 0) => {
     const recentMessages = await loadRecentHiveMessages(
       hiveID,
@@ -414,7 +594,13 @@ export default function WorkspaceOverviewPanel({
     const recentTasks = sinceMs
       ? tasks.filter((task) => toMillis(task.updatedAt || task.createdAt) > sinceMs)
       : tasks;
-    const sourceBundle = summarizeSourcesForPrompt(recentMessages, recentDecisions, recentTasks);
+    const sourceBundle = summarizeSourcesForPrompt(
+      recentMessages,
+      recentDecisions,
+      recentTasks,
+      memberNameById,
+      currentUser
+    );
     const nextWindow = formatCatchupContextLabel(sinceMs);
 
     if (
@@ -456,47 +642,32 @@ Current tasks:
 ${sourceBundle.tasks.map((task) => `- ${task.title} | status: ${task.status} | priority: ${task.priority} | decision: ${task.linkedDecisionTitle || "none"}${task.blockReason ? ` | blocked because: ${task.blockReason}` : ""}`).join("\n") || "- none"}
     `.trim();
 
-    const reply = await callGeminiAPI(promptText, "gemini-2.5-flash", [], {
+    const reply = await requestWorkspaceAssistant(promptText, {
       hiveID,
       feature: "workspace_catchup",
       scope: "hive",
     });
+    const issue = getAIResponseIssue(reply);
+    const fallbackText = buildFallbackCatchup({
+      hiveName,
+      messages: recentMessages,
+      decisions: recentDecisions,
+      tasks: recentTasks,
+    });
 
     return {
-      text:
-        String(reply || "").trim() ||
-        buildFallbackCatchup({
-          hiveName,
-          messages: recentMessages,
-          decisions: recentDecisions,
-          tasks: recentTasks,
-        }),
+      text: issue ? fallbackText : String(reply || "").trim() || fallbackText,
       sourceBundle,
       window: nextWindow,
     };
-  }, [currentUser?.displayName, currentUser?.email, decisions, hiveID, hiveName, honeycombs, tasks]);
+  }, [currentUser?.displayName, currentUser?.email, decisions, hiveID, hiveName, honeycombs, memberNameById, tasks]);
 
   useEffect(() => {
-    const hasData = honeycombs.length > 0 || decisions.length > 0 || tasks.length > 0;
-
-    if (!hasData) {
-      setCatchupText(
-        "No recent workspace activity yet. Start a room discussion, close a thread, or create a task to generate a catch-up briefing."
-      );
-      setCatchupWindow("Recent workspace summary");
-      return;
-    }
-
-    if (lastCatchupKeyRef.current === catchupKey) {
-      return;
-    }
-
-    lastCatchupKeyRef.current = catchupKey;
     let cancelled = false;
 
-    async function hydrateCatchup() {
+    async function hydrateCatchupState() {
       try {
-        setLoadingCatchup(true);
+        const hasData = honeycombs.length > 0 || decisions.length > 0 || tasks.length > 0;
         let sinceMs = catchupBaselineRef.current;
         if (!catchupBaselineLoadedRef.current) {
           sinceMs = currentUser?.uid
@@ -505,41 +676,48 @@ ${sourceBundle.tasks.map((task) => `- ${task.title} | status: ${task.status} | p
           catchupBaselineRef.current = sinceMs;
           catchupBaselineLoadedRef.current = true;
         }
-        const response = await requestCatchup("brief", sinceMs);
         if (!cancelled) {
-          setLastSources(response.sourceBundle);
-          setCatchupWindow(response.window);
-          setCatchupText(response.text);
+          setCatchupWindow(formatCatchupContextLabel(sinceMs));
+          setCatchupText(
+            hasData
+              ? buildFallbackCatchup({
+                  hiveName,
+                  messages: [],
+                  decisions,
+                  tasks,
+                })
+              : "No recent workspace activity yet. Start a room discussion, close a thread, or create a task to generate a catch-up briefing."
+          );
         }
         if (currentUser?.uid && !catchupSeenMarkedRef.current) {
           await updateLastSeen(hiveID, null, null, currentUser.uid);
           catchupSeenMarkedRef.current = true;
         }
       } catch (error) {
-        console.error("Failed to build workspace catchup:", error);
+        console.error("Failed to hydrate workspace catchup state:", error);
         if (!cancelled) {
+          const hasData = honeycombs.length > 0 || decisions.length > 0 || tasks.length > 0;
+          setCatchupWindow("Recent workspace summary");
           setCatchupText(
-            buildFallbackCatchup({
-              hiveName,
-              messages: [],
-              decisions,
-              tasks,
-            })
+            hasData
+              ? buildFallbackCatchup({
+                  hiveName,
+                  messages: [],
+                  decisions,
+                  tasks,
+                })
+              : "No recent workspace activity yet. Start a room discussion, close a thread, or create a task to generate a catch-up briefing."
           );
-        }
-      } finally {
-        if (!cancelled) {
-          setLoadingCatchup(false);
         }
       }
     }
 
-    hydrateCatchup();
+    hydrateCatchupState();
 
     return () => {
       cancelled = true;
     };
-  }, [catchupKey, currentUser?.uid, decisions, hiveID, hiveName, honeycombs.length, tasks, requestCatchup]);
+  }, [currentUser?.uid, decisions, hiveID, hiveName, honeycombs.length, tasks]);
 
   const askCopilot = async (event) => {
     event?.preventDefault?.();
@@ -550,11 +728,21 @@ ${sourceBundle.tasks.map((task) => `- ${task.title} | status: ${task.status} | p
       const recentMessages =
         lastSources.messages.length > 0
           ? lastSources.messages
-          : summarizeSourcesForPrompt(await loadRecentHiveMessages(hiveID, honeycombs), decisions, tasks).messages;
+          : summarizeSourcesForPrompt(
+              await loadRecentHiveMessages(hiveID, honeycombs),
+              decisions,
+              tasks,
+              memberNameById,
+              currentUser
+            ).messages;
       const sourceBundle = {
         messages: recentMessages,
-        decisions: lastSources.decisions.length ? lastSources.decisions : summarizeSourcesForPrompt([], decisions, tasks).decisions,
-        tasks: lastSources.tasks.length ? lastSources.tasks : summarizeSourcesForPrompt([], decisions, tasks).tasks,
+        decisions: lastSources.decisions.length
+          ? lastSources.decisions
+          : summarizeSourcesForPrompt([], decisions, tasks, memberNameById, currentUser).decisions,
+        tasks: lastSources.tasks.length
+          ? lastSources.tasks
+          : summarizeSourcesForPrompt([], decisions, tasks, memberNameById, currentUser).tasks,
       };
 
       setLastSources(sourceBundle);
@@ -562,7 +750,24 @@ ${sourceBundle.tasks.map((task) => `- ${task.title} | status: ${task.status} | p
       const groundedPrompt = `
 You are the HiveMind dashboard copilot for workspace "${hiveName || hiveID}".
 Answer the user's question using only the workspace state below.
-Be concrete and action-oriented. If the answer is uncertain, say so briefly.
+Be concrete, action-oriented, and sound like a real project copilot rather than a template.
+Synthesize the workspace state instead of echoing canned phrases.
+If the answer is uncertain, say so briefly and explain what context is missing.
+Important:
+- The signed-in user is "${String(currentUser?.displayName || currentUser?.email || currentUser?.uid || "Unknown user")}" with uid "${String(
+        currentUser?.uid || ""
+      )}" and email "${String(currentUser?.email || "")}".
+- If the user asks about "my tasks" or tasks assigned to them, only count tasks where assignees include the current user id "${String(
+        currentUser?.uid || ""
+      )}" or email "${String(currentUser?.email || "")}".
+- Do not infer assignment from status alone.
+- Never call another teammate "you".
+- If a task is assigned to someone else, name that teammate explicitly.
+- If the question uses "we", "us", "our", or "team", answer from a team perspective and avoid personal assignment language unless you name the assignee.
+- If identity is ambiguous, prefer teammate names over pronouns.
+- If the user asks what to work on next, prioritize blocked work, critical/high priority tasks, overdue tasks, and the freshest active signals from messages/decisions.
+- When helpful, cite the exact room, task, or decision title that supports the answer.
+- Do not say "based on the provided information" or similar filler unless absolutely necessary.
 
 Recent messages:
 ${sourceBundle.messages.map((message) => `- [${message.honeycombName}] ${message.sender}: ${message.text}`).join("\n") || "- none"}
@@ -571,17 +776,32 @@ Recent decisions:
 ${sourceBundle.decisions.map((decision) => `- ${decision.title}: ${decision.summary}`).join("\n") || "- none"}
 
 Current tasks:
-${sourceBundle.tasks.map((task) => `- ${task.title} | ${task.status} | priority ${task.priority} | decision ${task.linkedDecisionTitle || "none"}${task.blockReason ? ` | blocked because ${task.blockReason}` : ""}`).join("\n") || "- none"}
+${sourceBundle.tasks
+  .map(
+    (task) =>
+      `- ${task.title} | ${task.status} | priority ${task.priority} | assignees ${
+        task.assignees?.map((entry) => entry.label).join(", ") || "none"
+      } | decision ${task.linkedDecisionTitle || "none"}${
+        task.blockReason ? ` | blocked because ${task.blockReason}` : ""
+      }`
+  )
+  .join("\n") || "- none"}
 
 User question:
 ${prompt.trim()}
       `.trim();
 
-      const reply = await callGeminiAPI(groundedPrompt, "gemini-2.5-flash", [], {
+      const reply = await requestWorkspaceAssistant(groundedPrompt, {
         hiveID,
         feature: "workspace_copilot",
         scope: "hive",
       });
+      const issue = getAIResponseIssue(reply);
+      if (issue) {
+        setCopilotAnswer(buildCopilotUnavailableMessage(issue));
+        return;
+      }
+
       setCopilotAnswer(String(reply || "").trim() || "The project copilot could not respond right now.");
     } catch (error) {
       console.error("Workspace copilot failed:", error);
@@ -594,7 +814,16 @@ ${prompt.trim()}
   const refreshCatchup = async (detail) => {
     try {
       setLoadingCatchup(true);
-      const response = await requestCatchup(detail, catchupBaselineRef.current);
+      let sinceMs = catchupBaselineRef.current;
+      if (!catchupBaselineLoadedRef.current) {
+        sinceMs = currentUser?.uid
+          ? await getLastSeen(hiveID, null, null, currentUser.uid)
+          : 0;
+        catchupBaselineRef.current = sinceMs;
+        catchupBaselineLoadedRef.current = true;
+      }
+
+      const response = await requestCatchup(detail, sinceMs);
       setLastSources(response.sourceBundle);
       setCatchupWindow(response.window);
       setCatchupText(response.text);
@@ -705,7 +934,10 @@ ${prompt.trim()}
                       {formatRelativeTime(decision.updatedAt || decision.createdAt || decision.closedAt)}
                     </span>
                     <span>
-                      {decision.ownerDisplayName || decision.createdByDisplayName || "Team"}
+                      {labelCurrentUser(
+                        decision.ownerDisplayName || decision.createdByDisplayName || "Team",
+                        currentUser
+                      )}
                     </span>
                     <span>
                       {roomNameById[String(decision.source?.honeycombID || decision.honeycombID || "")] ||

@@ -32,6 +32,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# local firebase cli state
+.firebase-config/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
@@ -67,6 +70,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+
+# local sandbox runtime state
+.sandbox-sessions/
+.sandbox-workspaces/
 
 # env files (can opt-in for committing if needed)
 .env*

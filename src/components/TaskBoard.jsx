@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import CreateTaskModal from "@/components/CreateTaskModal";
 import TaskStatusModal from "@/components/TaskStatusModal";
-import { createTaskRecord, updateTaskRecord } from "@/lib/data/taskRepository";
+import { createTaskRecord, deleteTaskRecord, updateTaskRecord } from "@/lib/data/taskRepository";
 
 const BOARD_COLUMNS = [
   { id: "todo", label: "To Do" },
@@ -42,6 +42,7 @@ export default function TaskBoard({
   const [expandedTaskId, setExpandedTaskId] = useState(null);
   const [updatingTaskId, setUpdatingTaskId] = useState(null);
   const [createModalOpen, setCreateModalOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState(null);
   const [statusModalTask, setStatusModalTask] = useState(null);
   const [statusModalTarget, setStatusModalTarget] = useState("");
   const memberMap = useMemo(() => buildMemberMap(members), [members]);
@@ -155,6 +156,69 @@ export default function TaskBoard({
           }
         : null,
     });
+  };
+
+  const editTask = async ({
+    title,
+    description,
+    checklist,
+    status,
+    priority,
+    blockReason,
+    dueAt,
+    assignees,
+    linkedDecisionId,
+  }) => {
+    if (!editingTask?.id) return;
+
+    const linkedDecision =
+      decisions.find((decision) => String(decision.id) === String(linkedDecisionId || "")) || null;
+
+    await updateTaskRecord({
+      hiveID,
+      taskID: editingTask.id,
+      patch: {
+        title: String(title || "").trim() || "New Task",
+        description: String(description || ""),
+        checklist: Array.isArray(checklist) ? checklist : [],
+        status,
+        priority,
+        blockReason,
+        dueAt,
+        assignees,
+        linkedDecisionId: linkedDecision?.id || "",
+        linkedDecisionTitle: linkedDecision?.title || "",
+        sourcePreview: linkedDecision
+          ? {
+              ...(editingTask.sourcePreview || {}),
+              decisionTitle: linkedDecision.title || "",
+              decisionSummary: linkedDecision.summary || linkedDecision.decision || "",
+            }
+          : {
+              ...(editingTask.sourcePreview || {}),
+              decisionTitle: "",
+              decisionSummary: "",
+            },
+      },
+    });
+  };
+
+  const removeDoneTask = async (task) => {
+    if (!task?.id) return;
+    const confirmed = window.confirm(
+      `Remove "${task.title || "this task"}" from Done? This deletes the task record.`
+    );
+    if (!confirmed) return;
+
+    try {
+      setUpdatingTaskId(task.id);
+      await deleteTaskRecord({ hiveID, taskID: task.id });
+    } catch (error) {
+      console.error("Failed to remove done task:", error);
+      alert("Could not remove the task right now.");
+    } finally {
+      setUpdatingTaskId(null);
+    }
   };
 
   return (
@@ -284,6 +348,23 @@ export default function TaskBoard({
                         >
                           View decision
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditingTask(task)}
+                          className="button-secondary text-sm"
+                        >
+                          Edit task
+                        </button>
+                        {String(task.status || "").toLowerCase() === "done" ? (
+                          <button
+                            type="button"
+                            onClick={() => removeDoneTask(task)}
+                            disabled={updatingTaskId === task.id}
+                            className="button-ghost text-sm"
+                          >
+                            {updatingTaskId === task.id ? "Removing..." : "Remove task"}
+                          </button>
+                        ) : null}
                         {String(task.status || "").toLowerCase() === "blocked" ? (
                           <button
                             type="button"
@@ -344,6 +425,18 @@ export default function TaskBoard({
         titleOverride="Create workspace task"
         subtitleOverride="Plan work directly from the board, assign owners, and optionally connect it to a stored decision."
         submitLabel="Create task"
+      />
+
+      <CreateTaskModal
+        open={Boolean(editingTask)}
+        onClose={() => setEditingTask(null)}
+        onSave={editTask}
+        members={members}
+        decisionOptions={decisionOptions}
+        initialTask={editingTask}
+        titleOverride="Edit task"
+        subtitleOverride="Update task details, owners, status, and linked decision."
+        submitLabel="Save changes"
       />
 
       <TaskStatusModal

@@ -26,6 +26,8 @@ export default function LogDecisionModal({
   onSave,
   messageText = "",
   decisionOptions = [],
+  titleOverride = "Log decision from message",
+  subtitleOverride = "Confirm the final call before it becomes part of the hive's long-term memory.",
   submitLabel = "Log decision",
 }) {
   const initial = useMemo(
@@ -83,36 +85,35 @@ export default function LogDecisionModal({
 
   return (
     <div
-      className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-950/78 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-[110] flex items-start justify-center overflow-y-auto bg-slate-950/78 p-4 backdrop-blur-sm sm:items-center"
       onClick={onClose}
     >
       <div
-        className="glass-panel w-full max-w-3xl border border-amber-300/18"
+        className="glass-panel flex max-h-[min(92vh,64rem)] w-full max-w-3xl flex-col overflow-hidden border border-amber-300/18"
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="space-y-5">
-          <div className="chat-header">
+        <div className="chat-header flex-shrink-0 border-b border-white/10 pb-4">
             <div>
               <span className="hero-chip">Decision review</span>
-              <h2 className="panel-title mt-4 text-2xl">Log decision from message</h2>
-              <p className="panel-subtitle mt-3">
-                Confirm the final call before it becomes part of the hive's long-term memory.
-              </p>
+              <h2 className="panel-title mt-4 text-2xl">{titleOverride}</h2>
+              <p className="panel-subtitle mt-3">{subtitleOverride}</p>
             </div>
 
             <button type="button" onClick={onClose} className="button-ghost">
               Close
             </button>
-          </div>
+        </div>
 
-          <label className="block">
+        <div className="mt-5 min-h-0 flex-1 overflow-y-auto pr-1">
+          <div className="space-y-5">
+            <label className="block">
             <span className="label-text">Title</span>
             <input
               className="input-shell"
               value={title}
               onChange={(event) => setTitle(event.target.value)}
             />
-          </label>
+            </label>
 
           <div className="grid gap-3 md:grid-cols-[minmax(0,1fr),220px]">
             <label className="block">
@@ -185,14 +186,16 @@ export default function LogDecisionModal({
             </p>
           </div>
 
-          <div className="action-row justify-end">
-            <button type="button" onClick={onClose} className="button-ghost" disabled={saving}>
-              Cancel
-            </button>
-            <button type="button" onClick={submit} className="button-primary" disabled={saving}>
-              {saving ? "Saving..." : submitLabel}
-            </button>
           </div>
+        </div>
+
+        <div className="action-row mt-5 flex-shrink-0 justify-end border-t border-white/10 pt-4">
+          <button type="button" onClick={onClose} className="button-ghost" disabled={saving}>
+            Cancel
+          </button>
+          <button type="button" onClick={submit} className="button-primary" disabled={saving}>
+            {saving ? "Saving..." : submitLabel}
+          </button>
         </div>
       </div>
     </div>
